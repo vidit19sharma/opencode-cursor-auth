@@ -84,13 +84,24 @@ type Sink = {
 
 type ErrorBody = { error: { message: string; type: string; code?: string } }
 
+// err.code is Cursor's backend error name (MODEL_BLOCKED, PRO_USER_USAGE_LIMIT, ...) when the SDK has
+// one. The SDK files a bad key under ConfigurationError and a spent plan under RateLimitError, so the
+// code decides those before the class does.
+const KEY_CODES = new Set(["BAD_API_KEY", "BAD_USER_API_KEY", "unauthenticated"])
+const USAGE_LIMIT_CODES = new Set(["FREE_USER_USAGE_LIMIT", "PRO_USER_USAGE_LIMIT"])
+
 function statusFor(err: unknown): number {
-  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown }
+  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; syscall?: unknown }
+  // a local failure (EACCES writing AGENTS.md says "permission denied") is not Cursor's verdict on the
+  // model, and a 403 would mark the model blocked
+  if (typeof e.syscall === "string") return 502
   const msg = String(e.message ?? err ?? "")
   const code = typeof e.code === "string" ? e.code : ""
-  if (err instanceof AuthenticationError || e.status === 401 || code === "unauthenticated" || /invalid user api key/i.test(msg)) return 401
+  if (err instanceof AuthenticationError || e.status === 401 || KEY_CODES.has(code) || /invalid user api key/i.test(msg)) return 401
+  // 402, not 429: opencode retries a 429, and waiting does not refill a plan's included usage
+  if (USAGE_LIMIT_CODES.has(code)) return 402
   if (err instanceof RateLimitError || e.status === 429 || code === "resource_exhausted" || /rate limit/i.test(msg)) return 429
-  if (code === "permission_denied" || /model blocked|permission denied|forbidden/i.test(msg)) return 403
+  if (code === "MODEL_BLOCKED" || code === "permission_denied" || /model blocked|permission denied|forbidden/i.test(msg)) return 403
   if (err instanceof ConfigurationError || code === "invalid_argument" || code === "not_found" || /cannot use this model|unknown model/i.test(msg)) return 400
   return 502
 }
@@ -98,8 +109,18 @@ function statusFor(err: unknown): number {
 const ERROR_TYPE: Record<number, string> = {
   400: "invalid_request_error",
   401: "authentication_error",
+  402: "insufficient_quota",
   403: "permission_error",
   429: "rate_limit_error",
+}
+
+// "try again in 30 seconds" / "resets in 2h": tell opencode how long to wait instead of letting it guess
+function retryAfterSeconds(msg: string): number | undefined {
+  const m = msg.match(/\b(?:in|after)\s+(\d+(?:\.\d+)?)\s*(ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b/i)
+  if (!m) return undefined
+  const unit = m[2].toLowerCase()
+  const factor = unit === "ms" ? 0.001 : unit.startsWith("s") ? 1 : unit.startsWith("m") ? 60 : 3600
+  return Math.max(1, Math.ceil(Number(m[1]) * factor))
 }
 
 function errorBody(err: unknown, status = statusFor(err)): ErrorBody {
@@ -117,12 +138,14 @@ const abortError = () => new DOMException("aborted", "AbortError")
 const isAbort = (err: unknown) => (err as { name?: unknown } | null)?.name === "AbortError"
 
 export function isTransient(err: unknown): boolean {
-  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; name?: unknown }
-  if (e.name === "AbortError") return false
+  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; name?: unknown; isRetryable?: unknown }
+  // the SDK marks aborts isRetryable:true; an abort is never worth retrying
+  if (e.name === "AbortError" || e.code === "ABORT_ERR") return false
   const status = statusFor(err)
   if (status === 429) return true
-  if (status === 400 || status === 401 || status === 403 || e.status === 404) return false
-  if (err instanceof NetworkError || (typeof e.status === "number" && e.status >= 500)) return true
+  if (status === 400 || status === 401 || status === 402 || status === 403 || e.status === 404) return false
+  // isRetryable is the backend's own flag; the SDK defaults it to false when none was sent, so only true counts
+  if (e.isRetryable === true || err instanceof NetworkError || (typeof e.status === "number" && e.status >= 500)) return true
   return /unavailable|deadline_exceeded|ECONNRESET|ETIMEDOUT|fetch failed/i.test(`${e.code ?? ""} ${e.message ?? ""}`)
 }
 
@@ -187,7 +210,9 @@ export function _setMaxActive(n: number) {
 }
 
 export function errorResponse(err: unknown, status = statusFor(err)): Response {
-  return Response.json(errorBody(err, status), { status })
+  const body = errorBody(err, status)
+  const wait = status === 429 ? retryAfterSeconds(body.error.message) : undefined
+  return Response.json(body, { status, ...(wait ? { headers: { "retry-after": String(wait) } } : {}) })
 }
 
 function chunk(id: string, model: string, delta: Record<string, unknown>, finish: string | null, usage?: Usage) {

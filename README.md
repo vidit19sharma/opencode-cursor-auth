@@ -14,7 +14,7 @@ The plugin bridges opencode's OpenAI-style chat requests to the official [`@curs
 - **System prompts** — delivered via `AGENTS.md` in a per-session workspace (the `--system-prompt` flag is server-gated by Cursor)
 - **Dynamic model list with variants** — fetched live from `Cursor.models.list()`, cached 24h; one id per model, with every reasoning-effort / thinking / fast / context variant on opencode's Ctrl+T variant picker
 - **Context limits** — each model publishes the context window of Cursor's default variant, so opencode's auto-compaction and context indicator work
-- **Real error statuses** — 400 / 401 / 403 / 429 / 502 instead of a 200 stream carrying an error
+- **Real error statuses** — 400 / 401 / 402 / 403 / 429 / 502 instead of a 200 stream carrying an error
 - **Cancellation** — Esc or a sub-agent timeout cancels the Cursor run and closes the agent
 - **Concurrency cap and retry** — at most 4 Cursor runs at once (configurable); transient failures retried before the first byte
 - **Usage** — prompt, completion, cached-read, and reasoning tokens reported to opencode
@@ -160,8 +160,9 @@ opencode ──(OpenAI chat JSON)──> plugin fetch() ──> @cursor/sdk Agen
 | --- | --- |
 | 400 | Unknown model or bad argument (Cursor's message), unknown variant param; also an expired tool-call continuation |
 | 401 | SDK key missing/expired, or Cursor rejects the key |
+| 402 | Plan usage limit reached (`insufficient_quota`); not retried, waiting won't help |
 | 403 | Model blocked for your account (`permission_error`) |
-| 429 | Cursor rate limit |
+| 429 | Cursor rate limit; carries `retry-after` when Cursor's message names a wait |
 | 502 | Anything else |
 
 These are JSON error responses when the failure happens before the first byte; mid-stream failures emit an SSE `error` frame and close the stream without `[DONE]`.
