@@ -149,10 +149,10 @@ opencode ──(OpenAI chat JSON)──> plugin fetch() ──> @cursor/sdk Agen
 
 - opencode calls the provider's `fetch` — the plugin intercepts it in-process; `http://cursor.local/v1` is a dummy URL that never resolves.
 - Each opencode tool is registered as a Cursor **custom tool** whose `execute()` parks a promise, emits an OpenAI `tool_calls` chunk, and resumes the *same* Cursor run when opencode sends the tool result back.
-- Conversation prefixes, plus the opencode session id (sent via the `chat.headers` hook), are hashed → mapped to Cursor agent IDs, so follow-up turns use `Agent.resume` instead of replaying history. The map persists at `~/.cache/opencode-cursor-auth/sessions.json`.
+- Each opencode session + agent (sent as headers via the `chat.headers` hook) maps to one Cursor agent ID, so follow-up turns use `Agent.resume` instead of replaying history — across restarts too. A hash of the non-system messages detects a diverged history (revert, edit) and starts a fresh agent. The map persists at `~/.cache/opencode-cursor-auth/sessions.json`; expired workspaces are swept at load and released when opencode deletes the session.
 - System messages are written to `AGENTS.md` in a per-session temp workspace and loaded via Cursor's project rules (`settingSources: ["project"]`). Once no session references a workspace, the bridge deletes its Cursor agent (`Agent.delete`), Cursor's store and transcript for it under `~/.cursor/projects`, and the workspace itself.
 - The selected variant reaches the plugin as `providerOptions.cursor`; `@ai-sdk/openai-compatible` puts it in the request body as top-level `cursor_params: [{ id, value }, …]`, which the bridge validates and maps to Cursor `ModelSelection.params`.
-- New turns take a slot from a FIFO semaphore (`OPENCODE_CURSOR_MAX_ACTIVE`); tool-result continuations reuse their run's slot. `Agent.create` / `Agent.resume` / `send` are attempted up to 3 times with jittered exponential backoff on 429, 5xx, and network errors, never after the first byte.
+- New turns take a slot from a FIFO semaphore (`OPENCODE_CURSOR_MAX_ACTIVE`); a run parked on a tool call releases its slot and the continuation re-acquires one through a priority queue. `Agent.create` / `Agent.resume` / `send` are attempted up to 3 times with jittered exponential backoff on 429, 5xx, and network errors, never after the first byte.
 - The HTTP reply opens on the first text or thinking delta, so failures before any content become real HTTP errors.
 - The request's abort signal and stream cancel cancel the Cursor run, close the agent, and release its slot.
 
@@ -160,7 +160,7 @@ opencode ──(OpenAI chat JSON)──> plugin fetch() ──> @cursor/sdk Agen
 
 | Status | When |
 | --- | --- |
-| 400 | Unknown model or bad argument (Cursor's message), unknown variant param; also an expired tool-call continuation |
+| 400 | Unknown model or bad argument (Cursor's message), unknown variant param |
 | 401 | SDK key missing/expired, or Cursor rejects the key |
 | 402 | Plan usage limit reached (`insufficient_quota`); not retried, waiting won't help |
 | 403 | Model blocked for your account (`permission_error`) |
@@ -180,7 +180,7 @@ bun run test:cli     # exercises the npx setup command against temp config dirs 
 bun run smoke        # packs the plugin and loads it in a pristine HOME (startup, auth login, first request before login)
 ```
 
-The e2e suite (Tests 0-21) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, and token-usage estimation for tool loops.
+The e2e suite (Tests 0-26) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, token-usage estimation for tool loops, cross-process session resume, and the startup workspace sweep.
 
 ## Known limitations
 

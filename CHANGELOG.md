@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.3.5 — 2026-10-16
+
+### Fixed
+
+- Session resume only worked inside one opencode process. The session map was keyed by a hash of the full message history including the system prompt, and opencode's skill index paths differ per process, so every restart, `opencode run -c`, second terminal, or date rollover missed the map and replayed the whole conversation as prose. Sessions are now keyed by opencode's session id and agent name (sent as `x-opencode-session` / `x-opencode-agent` headers); the non-system message prefix is only used to detect a diverged history (revert, edit). `sessions.json` is now version 2; older files are ignored.
+- Every tool loop left a stale entry in the session map, so entries grew without bound, workspaces were never released, and a reverted conversation could resume the wrong Cursor agent. On the user's machine this had accumulated 192 temp workspaces and 396 `~/.cursor/projects` directories (113 MB). The scope entry is now overwritten and the displaced workspace released.
+- Workspaces and `~/.cursor/projects` directories left behind by a killed opencode process were never cleaned up. The plugin now sweeps expired `opencode-cursor-*` workspaces and their project directories at load, and releases a session's Cursor agent and workspace when opencode deletes the session.
+- A failure while creating the temp workspace leaked a concurrency slot.
+- Any 403 marked the model as blocked and hid it from the list; now only Cursor's `MODEL_BLOCKED` does.
+- An aborted, unauthenticated, or rate-limited `Agent.resume` destroyed the session entry; those cases now keep it.
+- Plugin init no longer races the auth-entry seeding.
+
 ## 0.3.4 — 2026-10-16
 
 ### Fixed
