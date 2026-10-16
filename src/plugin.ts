@@ -107,6 +107,8 @@ export const CursorAuthPlugin: Plugin = async (input) => {
         const model = cursor.models[id] as (typeof cursor.models)[string] & { variants?: Record<string, Record<string, unknown>> }
         model.cost = { input: 0, output: 0, cache_read: 0, cache_write: 0 }
         model.limit ??= { context: context ?? DEFAULT_CONTEXT, output: DEFAULT_OUTPUT }
+        // opencode attaches images only when input lists "image"; Cursor's catalog has no vision flag, all current models take images
+        model.modalities ??= { input: ["text", "image"], output: ["text"] }
         if (variants) model.variants ??= Object.fromEntries(Object.entries(variants).map(([n, v]) => [n, { cursor_params: v.params }]))
       }
     },

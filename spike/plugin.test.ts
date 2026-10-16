@@ -184,6 +184,15 @@ test("config: 30 min header/chunk timeouts unless the user set them", async () =
   expect(own.provider.cursor.options).toMatchObject({ chunkTimeout: 5, headerTimeout: 1_800_000 })
 })
 
+test("config: models accept images unless the user set modalities", async () => {
+  const cfg = {} as { provider?: Record<string, { models: Record<string, { modalities?: unknown }> }> }
+  await hooks.config!(cfg as never)
+  expect(cfg.provider!.cursor.models.auto.modalities).toEqual({ input: ["text", "image"], output: ["text"] })
+  const own = { provider: { cursor: { models: { auto: { name: "Auto", modalities: { input: ["text"], output: ["text"] } } } } } }
+  await hooks.config!(own as never)
+  expect(own.provider.cursor.models.auto.modalities).toEqual({ input: ["text"], output: ["text"] })
+})
+
 test("seedAuthEntry seeds sentinel before init resolves, only when no cursor entry exists", async () => {
   const dir = join(process.env.XDG_DATA_HOME!, "opencode")
   rmSync(dir, { recursive: true, force: true })
