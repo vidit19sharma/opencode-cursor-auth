@@ -338,7 +338,8 @@ function jsonCollector(model: string, resolve: (r: Response) => void): Sink {
   }
 }
 
-type SessionEntry = { agentId: string; cwd: string; lastUsedAt: number }
+// lastPrompt: prompt size of the turn that produced this entry (optional; older entries lack it)
+type SessionEntry = { agentId: string; cwd: string; lastUsedAt: number; lastPrompt?: number }
 
 type Deferred = { promise: Promise<Response>; resolve: (r: Response) => void; reject: (e: unknown) => void }
 
@@ -373,6 +374,9 @@ type Held = {
   flushTimer: ReturnType<typeof setTimeout> | null
   idleTimer: ReturnType<typeof setTimeout> | null
   usage?: Usage
+  // tool-requests-listed deltas seen on this run; model calls = calls + 1
+  calls: number
+  lastPrompt?: number
   wired: boolean
   done: boolean
   slot: boolean
@@ -534,6 +538,7 @@ function rememberSession(held: Held, toolCalls: ToolCallOut[]) {
     agentId: held.agent.agentId,
     cwd: held.cwd,
     lastUsedAt: Date.now(),
+    ...(held.lastPrompt ? { lastPrompt: held.lastPrompt } : {}),
   }
   const displaced = sessions.get(key) ?? diskSessions.get(key)
   sessions.set(key, entry)
@@ -554,17 +559,21 @@ async function syncAgentsMd(cwd: string, messages: OaMessage[]) {
   else if (existsSync(path)) rmSync(path)
 }
 
-function mapUsage(u?: {
-  inputTokens?: number
-  outputTokens?: number
-  cacheReadTokens?: number
-  reasoningTokens?: number
-}): Usage | undefined {
+// turn-ended usage sums every model call in the run (n calls, previous turn's prompt L). Prompts only
+// grow within a run, so the last call's prompt is at most S - (n-1)*L: an upper-bound estimate, clamped to [S/n, S].
+export function mapUsage(
+  u?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number },
+  n = 1,
+  L = 0,
+): Usage | undefined {
   if (!u) return undefined
-  const prompt = u.inputTokens ?? 0
+  const S = u.inputTokens ?? 0
+  const prompt = n <= 1 ? S : Math.min(S, Math.max(Math.ceil(S / n), S - (n - 1) * L))
   const completion = u.outputTokens ?? 0
   const usage: Usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
-  if (u.cacheReadTokens) usage.prompt_tokens_details = { cached_tokens: u.cacheReadTokens }
+  // inputTokens already includes cache; opencode subtracts cached from prompt, so keep it <= prompt
+  const cached = Math.min(u.cacheReadTokens ?? 0, prompt)
+  if (cached > 0) usage.prompt_tokens_details = { cached_tokens: cached }
   if (u.reasoningTokens) usage.completion_tokens_details = { reasoning_tokens: u.reasoningTokens }
   return usage
 }
@@ -701,7 +710,8 @@ async function wireRunCompletion(held: Held) {
   if (held.done) return
   if (result.status === "cancelled") return abortHeld(held)
   if (result.status === "error") return failHeld(held, result.error ?? new Error("cursor run failed"))
-  const usage = mapUsage(result.usage) ?? held.usage
+  const usage = mapUsage(result.usage, held.calls + 1, held.lastPrompt) ?? held.usage
+  if (usage) held.lastPrompt = usage.prompt_tokens
   teardownHeld(held)
   rememberSession(held, [])
   openReply(held)
@@ -813,6 +823,7 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   let agent: SDKAgent | undefined
   let cwd: string | undefined
   let newSuffix: OaMessage[] = body.messages
+  const lastPrompt = entry?.lastPrompt
   const agentOptions = (cwd: string) => ({
     model,
     tools: ["mcp"] as ["mcp"],
@@ -860,6 +871,8 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     parked: new Map(),
     flushTimer: null,
     idleTimer: null,
+    calls: 0,
+    lastPrompt,
     wired: false,
     done: false,
     slot: true,
@@ -910,7 +923,7 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   let run: Run
   try {
     run = await withRetry(() => agent.send(prompt, {
-      onDelta: ({ update }: { update: { type: string; text?: string; usage?: { inputTokens?: number; outputTokens?: number } } }) => {
+      onDelta: ({ update }: { update: { type: string; text?: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number } } }) => {
         if (self.done) return
         if (update.type === "text-delta" && update.text) {
           openReply(self)
@@ -924,8 +937,11 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
         } else if (update.type === "thinking-delta" && update.text) {
           openReply(self)
           emit(self, "reasoning", update.text)
+        } else if (update.type === "tool-requests-listed") {
+          // ponytail: empirical (6/6 live probes), model calls = listed + 1; no per-step usage event exists
+          self.calls++
         } else if (update.type === "turn-ended") {
-          self.usage = mapUsage(update.usage)
+          self.usage = mapUsage(update.usage, self.calls + 1, self.lastPrompt)
         }
       },
       local: { customTools: customTools as never },

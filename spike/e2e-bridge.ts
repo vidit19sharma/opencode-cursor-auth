@@ -3,7 +3,7 @@
  * Test 1: plain streaming chat. Test 2: tool loop (request -> tool_calls ->
  * follow-up request with tool result -> final answer on the SAME cursor run).
  */
-import { _failAfterFirstDelta, _resetForTest, _setBatchSettleMs, _setMaxActive, _stats, handleChatCompletion, isTransient, releaseParked, withRetry } from "../src/bridge.js";
+import { _failAfterFirstDelta, _resetForTest, _setBatchSettleMs, _setMaxActive, _stats, handleChatCompletion, isTransient, mapUsage, releaseParked, withRetry } from "../src/bridge.js";
 import { currentModels, resolveModel, resolveVariant } from "../src/models.js";
 import { rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -529,6 +529,44 @@ try {
 }
 if (!done20) console.log("Test 20 SKIPPED: model would not issue a late parallel call in 2 attempts");
 await assertClean("Test 20");
+
+// --- Test 21: usage estimate in a tool loop ---
+// turn-ended sums every model call; prompt_tokens must estimate the last call, never under it
+console.log("\n=== Test 21: usage estimate in a tool loop ===");
+const eq21 = (label: string, got: unknown, want: unknown) => {
+  console.log(label, JSON.stringify(got));
+  if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error(`Test 21 FAILED: ${label} expected ${JSON.stringify(want)}`);
+};
+eq21("one call:", mapUsage({ inputTokens: 4536, outputTokens: 5, cacheReadTokens: 3584 }, 1, 0), { prompt_tokens: 4536, completion_tokens: 5, total_tokens: 4541, prompt_tokens_details: { cached_tokens: 3584 } });
+eq21("4 calls, L=4536:", mapUsage({ inputTokens: 19147, outputTokens: 210, cacheReadTokens: 16384, reasoningTokens: 36 }, 4, 4536), { prompt_tokens: 5539, completion_tokens: 210, total_tokens: 5749, prompt_tokens_details: { cached_tokens: 5539 }, completion_tokens_details: { reasoning_tokens: 36 } });
+eq21("4 calls, L unknown:", mapUsage({ inputTokens: 19147, outputTokens: 210, cacheReadTokens: 16384 }, 4, 0), { prompt_tokens: 19147, completion_tokens: 210, total_tokens: 19357, prompt_tokens_details: { cached_tokens: 16384 } });
+eq21("4 calls, L huge (avg floor):", mapUsage({ inputTokens: 19147, outputTokens: 210 }, 4, 100000)?.prompt_tokens, Math.ceil(19147 / 4));
+
+const usageOf = async (res: Response) => {
+  let usage: { prompt_tokens: number; prompt_tokens_details?: { cached_tokens: number } } | undefined;
+  for (const line of (await res.text()).split("\n")) {
+    if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+    const u = JSON.parse(line.slice(6)).usage;
+    if (u) usage = u;
+  }
+  if (!usage) throw new Error("Test 21 FAILED: no usage on final chunk");
+  return usage;
+};
+// baseline: plain one-shot on a fresh scope; it also gives the tool-loop turn a known previous prompt (L)
+const msgs21: Record<string, unknown>[] = [{ role: "user", content: "Reply with exactly: BRIDGE-OK" }];
+const res21a = await handleChatCompletion({ model: "gpt-5.5", messages: msgs21 as never, tools: tools as never, stream: true }, undefined, undefined, "ses_test_usage");
+const base21 = await usageOf(res21a);
+msgs21.push({ role: "assistant", content: "BRIDGE-OK" });
+msgs21.push({ role: "user", content: "Call get_secret_number with label 'alpha', then tell me the number you got." });
+const seg21 = await readSse(await handleChatCompletion({ model: "gpt-5.5", messages: msgs21 as never, tools: tools as never, stream: true }, undefined, undefined, "ses_test_usage"));
+if (seg21.finish !== "tool_calls" || !seg21.toolCalls.length) throw new Error("Test 21 FAILED: no tool_calls turn");
+msgs21.push({ role: "assistant", content: seg21.content || null, tool_calls: seg21.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args } })) });
+const loop21 = await usageOf(await continueWith(withResult(msgs21, seg21.toolCalls[0].id, 7741), "ses_test_usage"));
+console.log("one-shot prompt_tokens:", base21.prompt_tokens, "| tool-loop prompt_tokens:", loop21.prompt_tokens, "| cached:", loop21.prompt_tokens_details?.cached_tokens ?? 0);
+if (!(loop21.prompt_tokens > 0)) throw new Error("Test 21 FAILED: zero prompt_tokens");
+if ((loop21.prompt_tokens_details?.cached_tokens ?? 0) > loop21.prompt_tokens) throw new Error("Test 21 FAILED: cached > prompt");
+if (loop21.prompt_tokens >= 2 * base21.prompt_tokens) throw new Error("Test 21 FAILED: tool-loop prompt still looks like the summed run");
+await assertClean("Test 21");
 
 console.log("\nALL BRIDGE TESTS PASSED");
 process.exit(0);
