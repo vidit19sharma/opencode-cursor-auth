@@ -180,7 +180,7 @@ bun run test:cli     # exercises the npx setup command against temp config dirs 
 bun run smoke        # packs the plugin and loads it in a pristine HOME (startup, auth login, first request before login)
 ```
 
-The test suite runs 13 scenarios: plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, and blocked models.
+The e2e suite (Tests 0-21) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, and token-usage estimation for tool loops.
 
 ## Known limitations
 
