@@ -117,7 +117,7 @@ opencode models | grep cursor/
 - **Blocked models**: Cursor's catalog has no per-account entitlement info. If Cursor rejects a model as "Model Blocked" (e.g. a team admin disabled it), the request fails with 403 `permission_error` carrying Cursor's message, and that model and all its variants are hidden from the list. Using a hidden id explicitly still sends it to Cursor. Blocked flags persist across catalog refreshes; delete `~/.cache/opencode-cursor-auth/models.json` to re-check.
 - **Offline / logged out**: the stale cache is used if present, otherwise only `cursor/auto`.
 
-The catalog is cached for 24h at `~/.cache/opencode-cursor-auth/models.json`; delete it to force a refresh.
+The catalog is cached for 24h at `~/.cache/opencode-cursor-auth/models.json`; delete it to force a refresh. An expired catalog is still used at startup and refreshed in the background, so new models appear on the next start; only a first run with no cache waits for Cursor (at most 15 s).
 
 ### Migrating from 0.2.0
 

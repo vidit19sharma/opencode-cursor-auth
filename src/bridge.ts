@@ -10,7 +10,7 @@
  */
 import { Agent, AuthenticationError, ConfigurationError, NetworkError, RateLimitError, type SDKAgent, type Run } from "@cursor/sdk"
 import { createHash, randomUUID } from "node:crypto"
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
@@ -393,7 +393,7 @@ function releaseCwd(cwd: string) {
   for (const v of sessions.values()) if (v.cwd === cwd) return
   for (const v of diskSessions.values()) if (v.cwd === cwd) return
   for (const h of heldByAgent.values()) if (h.cwd === cwd) return
-  rmSync(cwd, { recursive: true, force: true })
+  try { rmSync(cwd, { recursive: true, force: true }) } catch {}
 }
 
 // scope (opencode session id) is folded in so identical histories from
@@ -430,9 +430,29 @@ async function loadSessions() {
   } catch {}
 }
 
+let warnedSave = false
+
+// Best effort: a read-only or full cache dir must never fail or hang a request, it only costs resume
+// after a restart. Written via rename so a crash mid-write can't leave torn JSON behind.
 function saveSessions() {
-  mkdirSync(SESSION_STORE_DIR, { recursive: true })
-  writeFileSync(SESSION_STORE_PATH, JSON.stringify({ version: 1, entries: collectDiskEntries() }))
+  const tmp = `${SESSION_STORE_PATH}.${randomUUID()}.tmp`
+  try {
+    mkdirSync(SESSION_STORE_DIR, { recursive: true })
+    const fd = openSync(tmp, "w")
+    try {
+      writeSync(fd, JSON.stringify({ version: 1, entries: collectDiskEntries() }))
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, SESSION_STORE_PATH)
+  } catch (err) {
+    try { rmSync(tmp, { force: true }) } catch {}
+    if (!warnedSave) {
+      warnedSave = true
+      console.error(`[opencode-cursor-auth] could not save ${SESSION_STORE_PATH}, sessions resume only until restart: ${(err as Error).message}`)
+    }
+  }
 }
 
 function sweepSessions(save = true) {
@@ -782,9 +802,13 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     }
   }
 
-  await syncAgentsMd(cwd!, body.messages).catch((err) => {
-    if (!self.done) throw err
-  })
+  try {
+    await syncAgentsMd(cwd!, body.messages)
+  } catch (err) {
+    // through failHeld so the slot, the held run and the workspace are released
+    if (!self.done) failHeld(self, err)
+    return reply.promise
+  }
   if (self.done) return reply.promise
   const prompt =
     newSuffix
