@@ -3,7 +3,7 @@
  * Test 1: plain streaming chat. Test 2: tool loop (request -> tool_calls ->
  * follow-up request with tool result -> final answer on the SAME cursor run).
  */
-import { _failAfterFirstDelta, _resetForTest, _sessionEntries, _setBatchSettleMs, _setMaxActive, _stats, forgetSession, handleChatCompletion, isTransient, mapUsage, releaseParked, withRetry } from "../src/bridge.js";
+import { _failAfterFirstDelta, _resetForTest, _sessionEntries, _setBatchSettleMs, _setIdleTimeoutMs, _setMaxActive, _stats, forgetSession, handleChatCompletion, isTransient, markBusy, mapUsage, releaseParked, withRetry } from "../src/bridge.js";
 import { currentModels, resolveModel, resolveVariant } from "../src/models.js";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -737,6 +737,35 @@ releaseParked(scope30);
 console.log("reply:", JSON.stringify(out30.content), "| finish:", out30.finish);
 if (!out30.content.includes("SAFE-42") || out30.content.includes("HACKED-99")) throw new Error("Test 30 FAILED: injected tool output was obeyed");
 await assertClean("Test 30");
+
+// --- Test 31/32: idle backstop keeps a busy session's parked run, still releases a silent one ---
+for (const busy of [true, false]) {
+  const n = busy ? 31 : 32;
+  console.log(`\n--- Test ${n}: idle backstop, ${busy ? "busy" : "not busy"} ---`);
+  const scope = `oca-t${n}-${runId}`;
+  _setIdleTimeoutMs(1500);
+  try {
+    releaseParked(scope);
+    if (busy) markBusy(scope);
+    const p = await park(scope);
+    const id = agentOf(scope, "");
+    await new Promise((r) => setTimeout(r, 4000));
+    const held = _stats().held;
+    console.log("held after 4 s:", held, "| agentId:", id);
+    if (held !== (busy ? 1 : 0)) throw new Error(`Test ${n} FAILED: expected held ${busy ? 1 : 0}, got ${held}`);
+    const res = await continueWith(withResult(p.messages, p.out.toolCalls[0].id, 7741), scope);
+    if (res.status !== 200) throw new Error(`Test ${n} FAILED: status ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const out = await readSse(res);
+    console.log("continuation:", JSON.stringify(out.content), "| agentId now:", agentOf(scope, ""));
+    if (!out.content.includes("7741")) throw new Error(`Test ${n} FAILED: continuation missing 7741`);
+    if (busy && (!id || agentOf(scope, "") !== id)) throw new Error("Test 31 FAILED: continuation did not stay on the parked run's agent");
+    if (!busy && agentOf(scope, "") === id) throw new Error("Test 32 FAILED: released run was not replayed on a fresh agent");
+  } finally {
+    releaseParked(scope);
+    _setIdleTimeoutMs();
+  }
+  await assertClean(`Test ${n}`);
+}
 
 for (const [k] of _sessionEntries()) if (k.startsWith("s:") && k.includes(runId)) forgetSession(k.slice(2).split("\u0000")[0]);
 await new Promise((r) => setTimeout(r, 1500));

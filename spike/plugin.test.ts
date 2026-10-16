@@ -22,10 +22,12 @@ mock.module("@cursor/sdk", () => ({
 const bridgeMock = mock(async (..._a: unknown[]) => new Response("ok"))
 const releaseMock = mock((_scope: string) => {})
 const forgetMock = mock((_scope: string) => {})
+const busyMock = mock((_scope: string) => {})
 mock.module("../src/bridge.ts", () => ({
   handleChatCompletion: bridgeMock,
   releaseParked: releaseMock,
   forgetSession: forgetMock,
+  markBusy: busyMock,
   // same shape as the real errorResponse for the inputs plugin.ts passes
   errorResponse: (err: { message?: string; code?: string } | string, status: number) => {
     const e = typeof err === "string" ? { message: err } : err
@@ -165,6 +167,30 @@ test("login rejection → callback failed", async () => {
   expect(await result.callback()).toEqual({ type: "failed" })
 })
 
+test("login failure → stderr reason + failed", async () => {
+  loginMock.mockImplementation(() => Promise.reject(new Error("denied by user")))
+  const err = spyOn(console, "error").mockImplementation(() => {})
+  try {
+    const result = await oauth().authorize()
+    expect(await result.callback()).toEqual({ type: "failed" })
+    const lines = err.mock.calls.map((c) => String(c[0]))
+    expect(lines.some((l) => l.includes("Cursor login failed") && l.includes("denied by user"))).toBe(true)
+  } finally {
+    err.mockRestore()
+  }
+})
+
+test("login success resets the cached key status", async () => {
+  // logged-out status is cached for 60 s by the first request
+  expect((await callChat("cursor-sdk-store")).res.status).toBe(401)
+  statusMock.mockImplementation(async () => ({ status: "logged-in", apiKeyExpiresAtMs: Date.now() + 30 * DAY }))
+  expect((await callChat("cursor-sdk-store")).res.status).toBe(401)
+  loginMock.mockImplementation(() => Promise.resolve({ apiKey: "k" }))
+  const result = await oauth().authorize()
+  expect(await result.callback()).toEqual({ type: "success", key: "cursor-sdk-store" })
+  expect((await callChat("cursor-sdk-store")).res.status).toBe(200)
+})
+
 test("chat.headers stamps session + agent only for cursor provider", async () => {
   const run = async (providerID: string) => {
     const output = { headers: {} as Record<string, string> }
@@ -225,4 +251,16 @@ test("event: session idle releases that session's parked runs, other events do n
   await fire({ type: "session.updated", properties: { info: { id: "ses_idle" } } })
   await fire({ type: "message.updated", properties: { info: { sessionID: "ses_idle" } } })
   expect(releaseMock).toHaveBeenCalledTimes(2)
+})
+
+test("event: session busy/retry marks the session busy, idle does not", async () => {
+  busyMock.mockClear()
+  releaseMock.mockClear()
+  const fire = (event: unknown) => hooks.event!({ event } as never)
+  await fire({ type: "session.status", properties: { sessionID: "ses_b", status: { type: "busy" } } })
+  await fire({ type: "session.status", properties: { sessionID: "ses_r", status: { type: "retry", attempt: 1, message: "x", next: 0 } } })
+  await fire({ type: "session.status", properties: { sessionID: "ses_i", status: { type: "idle" } } })
+  await fire({ type: "session.idle", properties: { sessionID: "ses_b" } })
+  expect(busyMock.mock.calls).toEqual([["ses_b"], ["ses_r"]])
+  expect(releaseMock.mock.calls).toEqual([["ses_i"], ["ses_b"]])
 })

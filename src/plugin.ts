@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { Cursor, type SdkAuthStatus } from "@cursor/sdk"
-import { errorResponse, forgetSession, handleChatCompletion, releaseParked } from "./bridge.js"
+import { errorResponse, forgetSession, handleChatCompletion, markBusy, releaseParked } from "./bridge.js"
 import { currentModels } from "./models.js"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -113,8 +113,11 @@ export const CursorAuthPlugin: Plugin = async (input) => {
       }
     },
 
-    // Esc during a tool call: the session goes idle and nothing will continue its parked Cursor run
+    // Esc during a tool call: the session goes idle and nothing will continue its parked Cursor run;
+    // busy/retry: a long tool is still running, keep the parked run past the idle backstop
     event: async ({ event }) => {
+      if (event.type === "session.status" && (event.properties.status.type === "busy" || event.properties.status.type === "retry"))
+        markBusy(event.properties.sessionID)
       if (event.type === "session.idle" || (event.type === "session.status" && event.properties.status.type === "idle"))
         releaseParked(event.properties.sessionID)
       if (event.type === "session.deleted") forgetSession(event.properties.info.id)
@@ -158,7 +161,11 @@ export const CursorAuthPlugin: Plugin = async (input) => {
               method: "auto" as const,
               callback: async () => {
                 const result = await login
-                if (result instanceof Error) return { type: "failed" as const }
+                if (result instanceof Error) {
+                  console.error(`[opencode-cursor-auth] Cursor login failed: ${result.message}`)
+                  return { type: "failed" as const }
+                }
+                _resetKeyCache()
                 return { type: "success" as const, key: "cursor-sdk-store" }
               },
             }

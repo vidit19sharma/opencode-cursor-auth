@@ -229,6 +229,10 @@ export function _setBatchSettleMs(ms: number) {
   batchSettleMs = ms
 }
 
+export function _setIdleTimeoutMs(ms?: number) {
+  idleTimeoutMs = ms ?? TOOL_RESULT_TIMEOUT_MS
+}
+
 export function _setMaxActive(n: number) {
   maxActive = n
   pump()
@@ -392,6 +396,7 @@ type Held = {
   parked: Map<string, (result: string) => void>
   flushTimer: ReturnType<typeof setTimeout> | null
   idleTimer: ReturnType<typeof setTimeout> | null
+  parkedAt?: number
   usage?: Usage
   // tool-requests-listed deltas seen on this run; model calls = calls + 1
   calls: number
@@ -405,6 +410,11 @@ type Held = {
 
 let batchSettleMs = 300
 const TOOL_RESULT_TIMEOUT_MS = 10 * 60 * 1000
+let idleTimeoutMs = TOOL_RESULT_TIMEOUT_MS
+// ponytail: opencode crashing mid-tool sends no idle event, so a busy scope still releases after 2 h
+const PARKED_HARD_MAX_MS = 2 * 60 * 60 * 1000
+// opencode sessions reported busy/retry: their parked runs outlive the idle backstop
+const busyScopes = new Set<string>()
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 // ponytail: single-user plugin, fixed cap; make configurable if ever shared
 const MAX_SESSIONS = 256
@@ -648,7 +658,10 @@ function scheduleFlush(held: Held) {
 
 function armIdle(held: Held) {
   if (held.idleTimer) clearTimeout(held.idleTimer)
-  held.idleTimer = setTimeout(() => abortHeld(held), TOOL_RESULT_TIMEOUT_MS)
+  held.idleTimer = setTimeout(() => {
+    if (held.scope && busyScopes.has(held.scope) && Date.now() - (held.parkedAt ?? 0) < PARKED_HARD_MAX_MS) armIdle(held)
+    else abortHeld(held)
+  }, idleTimeoutMs)
   held.idleTimer.unref?.()
 }
 
@@ -730,14 +743,21 @@ function flushToolCalls(held: Held) {
   sink?.finish("tool_calls")
   rememberSession(held, calls)
   releaseHeldSlot(held)
+  held.parkedAt = Date.now()
   armIdle(held)
 }
 
 /** opencode session went idle (Esc during a tool call): drop its parked runs now, not in 10 min. */
 export function releaseParked(scope: string) {
+  busyScopes.delete(scope)
   for (const held of [...heldByAgent.values()]) {
     if (held.scope === scope && !held.done && !held.sink && !held.claimed) abortHeld(held)
   }
+}
+
+/** opencode session is working (busy/retry): keep its parked runs past the idle backstop. */
+export function markBusy(scope: string) {
+  busyScopes.add(scope)
 }
 
 /** opencode session deleted: nothing can resume its agents, release them and their workspaces now. */
@@ -916,7 +936,8 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   if (!agent) {
     try {
       cwd = await mkdtemp(TMP_CWD_PREFIX)
-      agent = await withRetry(() => Agent.create(agentOptions(cwd!)), signal)
+      const idempotencyKey = randomUUID()
+      agent = await withRetry(() => Agent.create({ ...agentOptions(cwd!), idempotencyKey }), signal)
     } catch (err) {
       releaseSlot()
       if (cwd) releaseCwd(cwd)
@@ -998,8 +1019,10 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   const images = imagesOf(newSuffix)
 
   let run: Run
+  const idempotencyKey = randomUUID()
   try {
     run = await withRetry(() => agent.send(images.length ? { text: prompt, images } : prompt, {
+      idempotencyKey,
       onDelta: ({ update }: { update: { type: string; text?: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number } } }) => {
         if (self.done) return
         if (update.type === "text-delta" && update.text) {
