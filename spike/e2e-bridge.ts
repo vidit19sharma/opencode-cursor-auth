@@ -3,7 +3,7 @@
  * Test 1: plain streaming chat. Test 2: tool loop (request -> tool_calls ->
  * follow-up request with tool result -> final answer on the SAME cursor run).
  */
-import { _failAfterFirstDelta, _resetForTest, _setMaxActive, _stats, handleChatCompletion, isTransient, withRetry } from "../src/bridge.js";
+import { _failAfterFirstDelta, _resetForTest, _setBatchSettleMs, _setMaxActive, _stats, handleChatCompletion, isTransient, releaseParked, withRetry } from "../src/bridge.js";
 import { currentModels, resolveModel, resolveVariant } from "../src/models.js";
 import { rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -415,6 +415,120 @@ if (raw15.includes("data: [DONE]")) throw new Error("Test 15 FAILED: [DONE] afte
 if (endedAfterError < 0 || endedAfterError > 5000) throw new Error(`Test 15 FAILED: stream ended ${endedAfterError}ms after error`);
 await assertClean("Test 15");
 await assertBridgeOk("Test 15");
+
+async function park(scope: string, prompt = "Call get_secret_number with label 'alpha', then tell me the number you got.") {
+  const messages: Record<string, unknown>[] = [
+    { role: "system", content: "You must use tools when relevant." },
+    { role: "user", content: prompt },
+  ];
+  const out = await readSse(await handleChatCompletion({ model: "gpt-5.5", messages: messages as never, tools: tools as never, stream: true }, undefined, undefined, scope));
+  if (out.finish !== "tool_calls" || !out.toolCalls.length) throw new Error(`park(${scope}) FAILED: no tool_calls turn`);
+  messages.push({
+    role: "assistant",
+    content: out.content || null,
+    tool_calls: out.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args } })),
+  });
+  return { messages, out };
+}
+
+const withResult = (messages: Record<string, unknown>[], id: string, n: number) => [...messages, { role: "tool", tool_call_id: id, content: JSON.stringify({ secret_number: n }) }];
+const continueWith = (messages: Record<string, unknown>[], scope: string) =>
+  handleChatCompletion({ model: "gpt-5.5", messages: messages as never, tools: tools as never, stream: true }, undefined, undefined, scope);
+
+// --- Test 16: a parked run gives its slot back ---
+console.log("\n=== Test 16: parked run releases its slot ===");
+_setMaxActive(1);
+const p16 = await park("ses_test_slot");
+const st16 = _stats();
+console.log("parked stats:", JSON.stringify(st16));
+if (st16.active !== 0 || st16.held !== 1) throw new Error("Test 16 FAILED: parked run still holds a slot");
+const plain16 = await Promise.race([
+  handleChatCompletion({ model: "gpt-5.5", messages: [{ role: "user", content: "Reply with exactly: BRIDGE-OK" }] as never, stream: true }).then(readSse),
+  new Promise<never>((_, rej) => setTimeout(() => rej(new Error("Test 16 FAILED: plain request waited on the parked run")), 120_000)),
+]);
+console.log("plain while parked:", JSON.stringify(plain16.content));
+if (!plain16.content.includes("BRIDGE-OK")) throw new Error("Test 16 FAILED: plain request");
+const out16 = await readSse(await continueWith(withResult(p16.messages, p16.out.toolCalls[0].id, 7741), "ses_test_slot"));
+console.log("continuation:", JSON.stringify(out16.content), "| stats:", JSON.stringify(_stats()));
+_setMaxActive(4);
+if (!out16.content.includes("7741")) throw new Error("Test 16 FAILED: continuation missing 7741");
+if (_stats().held !== 0 || _stats().active !== 0) throw new Error("Test 16 FAILED: leaked held/slot");
+
+// --- Test 17: session idle releases only that session's parked runs ---
+console.log("\n=== Test 17: idle release ===");
+await park("ses_test_idle");
+releaseParked("ses_test_other");
+console.log("after other-scope release:", JSON.stringify(_stats()));
+if (_stats().held !== 1) throw new Error("Test 17 FAILED: released another session's parked run");
+releaseParked("ses_test_idle");
+releaseParked("ses_test_idle");
+if (_stats().held !== 0) throw new Error("Test 17 FAILED: parked run not released");
+// (workspace release is not visible through _stats: the remembered session keeps the cwd for resume)
+await assertClean("Test 17");
+
+// --- Test 18: expired tool call replays instead of 400 ---
+console.log("\n=== Test 18: expired tool call replays ===");
+const p18 = await park("ses_test_replay");
+releaseParked("ses_test_replay");
+const res18 = await continueWith(withResult(p18.messages, p18.out.toolCalls[0].id, 7741), "ses_test_replay");
+console.log("status:", res18.status);
+if (res18.status !== 200) throw new Error(`Test 18 FAILED: status ${res18.status}: ${(await res18.text()).slice(0, 200)}`);
+const out18 = await readSse(res18);
+console.log("replayed content:", JSON.stringify(out18.content), "| finish:", out18.finish);
+if (!out18.content.includes("7741")) throw new Error("Test 18 FAILED: replayed agent did not see the tool result");
+await assertClean("Test 18");
+
+// --- Test 19: duplicate continuation -> one 200, one 409 ---
+console.log("\n=== Test 19: duplicate continuation ===");
+const p19 = await park("ses_test_dup");
+const msgs19 = withResult(p19.messages, p19.out.toolCalls[0].id, 7741);
+const [ra, rb] = await Promise.all([continueWith(msgs19, "ses_test_dup"), continueWith(msgs19, "ses_test_dup")]);
+const statuses19 = [ra.status, rb.status];
+console.log("statuses:", JSON.stringify(statuses19));
+const ok19 = [ra, rb].find((r) => r.status === 200);
+const dup19 = [ra, rb].find((r) => r.status === 409);
+if (!ok19 || !dup19) throw new Error(`Test 19 FAILED: expected one 200 and one 409, got ${statuses19}`);
+const body19 = await dup19.json();
+const out19 = await readSse(ok19);
+console.log("409 body:", JSON.stringify(body19), "| content:", JSON.stringify(out19.content));
+if (body19?.error?.code !== "continuation_in_progress") throw new Error("Test 19 FAILED: bad 409 body");
+if (!out19.content.includes("7741")) throw new Error("Test 19 FAILED: continuation missing 7741");
+await assertClean("Test 19");
+
+// --- Test 20: late parallel tool call goes out on the next segment ---
+console.log("\n=== Test 20: late parallel tool call ===");
+_setBatchSettleMs(1);
+let done20 = false;
+try {
+  for (let attempt = 1; attempt <= 2 && !done20; attempt++) {
+    const p20 = await park("ses_test_late_" + attempt, "Call get_secret_number for label 'alpha' AND for label 'beta' in parallel (two tool calls in the same step), then tell me both numbers.");
+    const first = p20.out.toolCalls;
+    console.log(`attempt ${attempt}: first segment tool calls:`, JSON.stringify(first));
+    if (first.length !== 1) {
+      releaseParked("ses_test_late_" + attempt);
+      console.log(first.length > 1 ? "(both calls landed in one 1ms batch)" : "");
+      continue;
+    }
+    const m20 = withResult(p20.messages, first[0].id, first[0].args.includes("beta") ? 2222 : 1111);
+    const seg2 = await readSse(await continueWith(m20, "ses_test_late_" + attempt));
+    console.log("second segment finish:", seg2.finish, "| tool calls:", JSON.stringify(seg2.toolCalls), "| content:", JSON.stringify(seg2.content));
+    if (seg2.finish !== "tool_calls" || seg2.toolCalls.length !== 1) {
+      releaseParked("ses_test_late_" + attempt);
+      console.log("(model did not issue a second parallel call)");
+      continue;
+    }
+    if (seg2.toolCalls[0].id === first[0].id) throw new Error("Test 20 FAILED: tool call emitted twice");
+    m20.push({ role: "assistant", content: seg2.content || null, tool_calls: seg2.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args } })) });
+    const final20 = await readSse(await continueWith(withResult(m20, seg2.toolCalls[0].id, seg2.toolCalls[0].args.includes("beta") ? 2222 : 1111), "ses_test_late_" + attempt));
+    console.log("final:", JSON.stringify(final20.content), "| finish:", final20.finish);
+    if (!final20.content.includes("1111") || !final20.content.includes("2222")) throw new Error("Test 20 FAILED: final answer missing a number");
+    done20 = true;
+  }
+} finally {
+  _setBatchSettleMs(300);
+}
+if (!done20) console.log("Test 20 SKIPPED: model would not issue a late parallel call in 2 attempts");
+await assertClean("Test 20");
 
 console.log("\nALL BRIDGE TESTS PASSED");
 process.exit(0);

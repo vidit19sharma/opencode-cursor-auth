@@ -166,28 +166,31 @@ export async function withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal, b
   }
 }
 
-// ponytail: global semaphore, slot held across parked tool loops; per-session fairness if it ever matters
+// ponytail: global semaphore over generating segments only (a parked run gives its slot back, a
+// continuation re-acquires ahead of new turns); per-session fairness if it ever matters
 let maxActive = Number(process.env.OPENCODE_CURSOR_MAX_ACTIVE) || 4
 let active = 0
 const waiters: (() => void)[] = []
+const priorityWaiters: (() => void)[] = []
 
 function pump() {
-  while (active < maxActive && waiters.length) {
+  while (active < maxActive && (priorityWaiters.length || waiters.length)) {
     active++
-    waiters.shift()!()
+    ;(priorityWaiters.shift() ?? waiters.shift()!)()
   }
 }
 
-function acquireSlot(signal?: AbortSignal): Promise<void> {
+function acquireSlot(signal?: AbortSignal, priority = false): Promise<void> {
   if (signal?.aborted) return Promise.reject(abortError())
-  if (active < maxActive && !waiters.length) {
+  const queue = priority ? priorityWaiters : waiters
+  if (active < maxActive && !priorityWaiters.length && (priority || !waiters.length)) {
     active++
     return Promise.resolve()
   }
   return new Promise((resolve, reject) => {
     const onAbort = () => {
-      const i = waiters.indexOf(go)
-      if (i >= 0) waiters.splice(i, 1)
+      const i = queue.indexOf(go)
+      if (i >= 0) queue.splice(i, 1)
       reject(abortError())
     }
     const go = () => {
@@ -195,13 +198,17 @@ function acquireSlot(signal?: AbortSignal): Promise<void> {
       resolve()
     }
     signal?.addEventListener("abort", onAbort, { once: true })
-    waiters.push(go)
+    queue.push(go)
   })
 }
 
 function releaseSlot() {
   active--
   pump()
+}
+
+export function _setBatchSettleMs(ms: number) {
+  batchSettleMs = ms
 }
 
 export function _setMaxActive(n: number) {
@@ -369,9 +376,11 @@ type Held = {
   wired: boolean
   done: boolean
   slot: boolean
+  // a continuation is waiting for its slot; blocks duplicates and idle release
+  claimed: boolean
 }
 
-const BATCH_SETTLE_MS = 300
+let batchSettleMs = 300
 const TOOL_RESULT_TIMEOUT_MS = 10 * 60 * 1000
 const SESSION_TTL_MS = 30 * 60 * 1000
 const DISK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -577,6 +586,25 @@ function attachSink(held: Held, sink: Sink) {
   if (held.buffer.length) openReply(held)
   for (const b of held.buffer) (b.kind === "text" ? sink.text : sink.reasoning)(b.t)
   held.buffer = []
+  // a parallel call that missed the previous flush goes out on this segment
+  if (held.pendingCalls.length) scheduleFlush(held)
+}
+
+function scheduleFlush(held: Held) {
+  if (held.flushTimer) clearTimeout(held.flushTimer)
+  held.flushTimer = setTimeout(() => flushToolCalls(held), batchSettleMs)
+}
+
+function armIdle(held: Held) {
+  if (held.idleTimer) clearTimeout(held.idleTimer)
+  held.idleTimer = setTimeout(() => abortHeld(held), TOOL_RESULT_TIMEOUT_MS)
+  held.idleTimer.unref?.()
+}
+
+function releaseHeldSlot(held: Held) {
+  if (!held.slot) return
+  held.slot = false
+  releaseSlot()
 }
 
 function attachSignal(held: Held, signal: AbortSignal | undefined) {
@@ -596,10 +624,7 @@ function closeAgent(held: Held) {
 
 function teardownHeld(held: Held) {
   held.done = true
-  if (held.slot) {
-    held.slot = false
-    releaseSlot()
-  }
+  releaseHeldSlot(held)
   held.detachSignal?.()
   held.detachSignal = null
   if (held.flushTimer) clearTimeout(held.flushTimer)
@@ -637,7 +662,8 @@ function abortHeld(held: Held) {
 /** Model requested tools: emit tool_calls, end this HTTP segment, park the run. */
 function flushToolCalls(held: Held) {
   held.flushTimer = null
-  if (held.done || !held.pendingCalls.length) return
+  // no sink: the calls stay pending until the next continuation attaches one
+  if (held.done || !held.sink || !held.pendingCalls.length) return
   const calls = held.pendingCalls
   held.pendingCalls = []
   for (const c of calls) agentByToolCallId.set(c.id, held.agent.agentId)
@@ -651,8 +677,15 @@ function flushToolCalls(held: Held) {
   sink?.toolCalls(calls)
   sink?.finish("tool_calls")
   rememberSession(held, calls)
-  held.idleTimer = setTimeout(() => abortHeld(held), TOOL_RESULT_TIMEOUT_MS)
-  held.idleTimer.unref?.()
+  releaseHeldSlot(held)
+  armIdle(held)
+}
+
+/** opencode session went idle (Esc during a tool call): drop its parked runs now, not in 10 min. */
+export function releaseParked(scope: string) {
+  for (const held of [...heldByAgent.values()]) {
+    if (held.scope === scope && !held.done && !held.sink && !held.claimed) abortHeld(held)
+  }
 }
 
 async function wireRunCompletion(held: Held) {
@@ -696,7 +729,7 @@ export function _stats() {
     disk: diskSessions.size,
     agentIds: [...sessions.values()].map((v) => v.agentId).sort(),
     active,
-    waiting: waiters.length,
+    waiting: waiters.length + priorityWaiters.length,
   }
 }
 
@@ -712,16 +745,34 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
 
   // continuation: trailing tool results for a parked run
   const lastMsg = body.messages[body.messages.length - 1]
-  if (lastMsg?.role === "tool" && lastMsg.tool_call_id) {
-    const agentId = agentByToolCallId.get(lastMsg.tool_call_id)
-    held = agentId ? heldByAgent.get(agentId) : undefined
-    if (!held || held.done) {
-      return Response.json(
-        { error: { message: "cursor run for this tool call expired — please retry", type: "invalid_request_error", code: "tool_call_expired" } },
-        { status: 400 },
-      )
-    }
+  let replay = false
+  const parked = lastMsg?.role === "tool" && lastMsg.tool_call_id ? heldByAgent.get(agentByToolCallId.get(lastMsg.tool_call_id) ?? "") : undefined
+  if (parked && !parked.done && (parked.sink || parked.claimed)) {
+    return Response.json(
+      { error: { message: "continuation already in progress for this tool call", type: "invalid_request_error", code: "continuation_in_progress" } },
+      { status: 409 },
+    )
+  }
+  if (parked && !parked.done) {
+    held = parked
+    held.claimed = true
     if (held.idleTimer) clearTimeout(held.idleTimer)
+    try {
+      await acquireSlot(signal, true)
+    } catch (err) {
+      held.claimed = false
+      if (!held.done) armIdle(held)
+      throw err
+    }
+    held.claimed = false
+    if (held.done) {
+      // torn down while queued (run failed): replay as a fresh turn below
+      releaseSlot()
+      held = undefined
+      replay = true
+    } else held.slot = true
+  } else if (lastMsg?.role === "tool") replay = true
+  if (held) {
     held.messages = body.messages
     held.textAcc = ""
     held.reply = reply
@@ -750,7 +801,15 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   const prefix = body.messages.slice(0, -1)
   const key = hashMessages(prefix, scope)
   await acquireSlot(signal)
-  const entry = sessions.get(key) ?? diskSessions.get(key)
+  // expired tool call: its run is gone, so a fresh agent gets the whole history (tool results included)
+  let entry = sessions.get(key) ?? diskSessions.get(key)
+  if (entry && replay) {
+    sessions.delete(key)
+    diskSessions.delete(key)
+    saveSessions()
+    releaseCwd(entry.cwd, entry.agentId)
+    entry = undefined
+  }
   let agent: SDKAgent | undefined
   let cwd: string | undefined
   let newSuffix: OaMessage[] = body.messages
@@ -804,6 +863,7 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     wired: false,
     done: false,
     slot: true,
+    claimed: false,
   }
   const self = held
   heldByAgent.set(agent.agentId, held)
@@ -819,8 +879,7 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
       execute: (args: unknown, ctx: { toolCallId?: string }) => {
         const id = (ctx.toolCallId ?? `call_${randomUUID()}`).replace(/\s+/g, "_")
         self.pendingCalls.push({ id, name: t.function.name, argumentsJson: JSON.stringify(args ?? {}) })
-        if (self.flushTimer) clearTimeout(self.flushTimer)
-        self.flushTimer = setTimeout(() => flushToolCalls(self), BATCH_SETTLE_MS)
+        if (self.sink) scheduleFlush(self)
         return new Promise<string>((resolve) => self.parked.set(id, resolve))
       },
     }
@@ -834,11 +893,18 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     return reply.promise
   }
   if (self.done) return reply.promise
+  const toolNames = new Map(newSuffix.flatMap((m) => (m.tool_calls ?? []).map((c) => [c.id, c.function?.name] as const)))
   const prompt =
     newSuffix
       .filter((m) => m.role !== "system")
-      .map((m) => (m.role === "user" ? textOf(m.content) : `${m.role.toUpperCase()}: ${textOf(m.content)}`))
+      .map((m) => {
+        if (m.role === "user") return textOf(m.content)
+        if (m.role === "tool") return `TOOL(${toolNames.get(m.tool_call_id ?? "") ?? m.tool_call_id}): ${textOf(m.content)}`
+        const calls = (m.tool_calls ?? []).map((c) => `\n[already called ${c.function?.name}(${c.function?.arguments ?? ""})]`).join("")
+        return `${m.role.toUpperCase()}: ${textOf(m.content)}${calls}`
+      })
       .filter(Boolean)
+      .concat(newSuffix.at(-1)?.role === "tool" ? ["(The tool calls above already ran and their results are shown. Do not call them again; continue from these results.)"] : [])
       .join("\n\n") || "(empty message)"
 
   let run: Run

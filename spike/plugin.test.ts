@@ -20,8 +20,10 @@ mock.module("@cursor/sdk", () => ({
   Agent: {},
 }))
 const bridgeMock = mock(async (..._a: unknown[]) => new Response("ok"))
+const releaseMock = mock((_scope: string) => {})
 mock.module("../src/bridge.ts", () => ({
   handleChatCompletion: bridgeMock,
+  releaseParked: releaseMock,
   // same shape as the real errorResponse for the inputs plugin.ts passes
   errorResponse: (err: { message?: string; code?: string } | string, status: number) => {
     const e = typeof err === "string" ? { message: err } : err
@@ -194,4 +196,16 @@ test("seedAuthEntry seeds sentinel only when no cursor entry exists", async () =
   await makePlugin(seeded)
   await Bun.sleep(20)
   expect(seeded.auth.set).not.toHaveBeenCalled()
+})
+
+test("event: session idle releases that session's parked runs, other events do not", async () => {
+  releaseMock.mockClear()
+  const fire = (event: unknown) => hooks.event!({ event } as never)
+  await fire({ type: "session.idle", properties: { sessionID: "ses_idle" } })
+  await fire({ type: "session.status", properties: { sessionID: "ses_status", status: { type: "idle" } } })
+  expect(releaseMock.mock.calls).toEqual([["ses_idle"], ["ses_status"]])
+  await fire({ type: "session.status", properties: { sessionID: "ses_busy", status: { type: "busy" } } })
+  await fire({ type: "session.updated", properties: { info: { id: "ses_idle" } } })
+  await fire({ type: "message.updated", properties: { info: { sessionID: "ses_idle" } } })
+  expect(releaseMock).toHaveBeenCalledTimes(2)
 })

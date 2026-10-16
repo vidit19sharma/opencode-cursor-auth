@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { Cursor, type SdkAuthStatus } from "@cursor/sdk"
-import { errorResponse, handleChatCompletion } from "./bridge.js"
+import { errorResponse, handleChatCompletion, releaseParked } from "./bridge.js"
 import { currentModels } from "./models.js"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -111,6 +111,12 @@ export const CursorAuthPlugin: Plugin = async (input) => {
         model.limit ??= { context: context ?? DEFAULT_CONTEXT, output: DEFAULT_OUTPUT }
         if (variants) model.variants ??= Object.fromEntries(Object.entries(variants).map(([n, v]) => [n, { cursor_params: v.params }]))
       }
+    },
+
+    // Esc during a tool call: the session goes idle and nothing will continue its parked Cursor run
+    event: async ({ event }) => {
+      if (event.type === "session.idle" || (event.type === "session.status" && event.properties.status.type === "idle"))
+        releaseParked(event.properties.sessionID)
     },
 
     "chat.headers": async (input, output) => {
