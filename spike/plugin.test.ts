@@ -170,6 +170,15 @@ test("chat.headers stamps session only for cursor provider", async () => {
   expect(await run("anthropic")).toEqual({})
 })
 
+test("config: 30 min header/chunk timeouts unless the user set them", async () => {
+  const cfg = {} as { provider?: Record<string, { options?: Record<string, unknown> }> }
+  await hooks.config!(cfg as never)
+  expect(cfg.provider!.cursor.options).toMatchObject({ headerTimeout: 1_800_000, chunkTimeout: 1_800_000, baseURL: "http://cursor.local/v1" })
+  const own = { provider: { cursor: { options: { chunkTimeout: 5 } } } }
+  await hooks.config!(own as never)
+  expect(own.provider.cursor.options).toMatchObject({ chunkTimeout: 5, headerTimeout: 1_800_000 })
+})
+
 test("seedAuthEntry seeds sentinel only when no cursor entry exists", async () => {
   const dir = join(process.env.XDG_DATA_HOME!, "opencode")
   rmSync(dir, { recursive: true, force: true })

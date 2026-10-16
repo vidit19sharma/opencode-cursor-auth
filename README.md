@@ -131,6 +131,7 @@ The models cache is refetched once on upgrade.
 | --- | --- | --- |
 | `OPENCODE_CURSOR_MAX_ACTIVE` | `4` | Max Cursor runs active at once; extra requests queue FIFO |
 | `CURSOR_API_KEY` | unset | Use this key instead of the stored SDK key |
+| `provider.cursor.options.headerTimeout` / `chunkTimeout` (opencode config) | 30 min | How long opencode waits for a reply to start / between chunks before aborting (opencode's own default is 5 min) |
 
 | Path | Contents |
 | --- | --- |

@@ -9,6 +9,11 @@ export { parseContext } from "./models.js"
 
 const BASE_URL = "http://cursor.local/v1"
 
+// opencode aborts a request after 5 min without response headers, or between chunks. A Cursor turn can
+// sit longer: queued for a slot, reasoning silently, or writing a large tool argument (sent only once
+// complete). Set provider.cursor.options to override.
+const STREAM_TIMEOUT_MS = 30 * 60 * 1000
+
 // Cursor publishes no output limit and the bridge never passes max_tokens to Cursor, so output is only an accounting reserve for opencode.
 const DEFAULT_CONTEXT = 200_000
 const DEFAULT_OUTPUT = 32_000
@@ -97,7 +102,7 @@ export const CursorAuthPlugin: Plugin = async (input) => {
       const cursor = (providers["cursor"] ??= { models: {} })
       cursor.npm ??= "@ai-sdk/openai-compatible"
       cursor.name ??= "Cursor"
-      cursor.options = { ...cursor.options, baseURL: BASE_URL }
+      cursor.options = { headerTimeout: STREAM_TIMEOUT_MS, chunkTimeout: STREAM_TIMEOUT_MS, ...cursor.options, baseURL: BASE_URL }
       cursor.models ??= {}
       for (const [id, { name, context, variants }] of Object.entries(await currentModels())) {
         cursor.models[id] ??= { name }
