@@ -1,5 +1,5 @@
 import { Cursor, type ModelListItem, type ModelParameterValue, type ModelSelection } from "@cursor/sdk"
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -24,8 +24,9 @@ let catalog: Record<string, ModelInfo> = {}
 let fetchedAt = 0
 
 function saveCatalog() {
-  mkdirSync(CACHE_DIR, { recursive: true })
-  writeFileSync(MODELS_CACHE_PATH, JSON.stringify({ version: 4, fetchedAt, models: catalog } satisfies ModelsCache))
+  mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 })
+  writeFileSync(MODELS_CACHE_PATH, JSON.stringify({ version: 4, fetchedAt, models: catalog } satisfies ModelsCache), { mode: 0o600 })
+  chmodSync(MODELS_CACHE_PATH, 0o600)
 }
 
 function contextValue(raw?: string): number | undefined {
