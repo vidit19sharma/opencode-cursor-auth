@@ -181,14 +181,16 @@ bun run test:cli     # exercises the npx setup command against temp config dirs 
 bun run smoke        # packs the plugin and loads it in a pristine HOME (startup, auth login, first request before login)
 ```
 
-The e2e suite (Tests 0-30) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, token-usage estimation for tool loops, cross-process session resume, the startup workspace sweep, image forwarding, workspace validation, built-in tool refusal, and replay injection.
+Release steps for maintainers are in [RELEASE.md](RELEASE.md).
+
+The e2e suite (Tests 0-32) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, token-usage estimation for tool loops, cross-process session resume, the startup workspace sweep, image forwarding, workspace validation, built-in tool refusal, replay injection, and the busy-aware idle backstop for parked runs.
 
 ## Known limitations
 
 - `systemPrompt` as a true harness replacement is feature-gated server-side by Cursor; system text is applied via `AGENTS.md` as a project rule (merged under Cursor's harness prompt).
 - Cursor's catalog has no entitlement info, so models your plan or team blocks only disappear after the first 403.
 - `limit.context` is per model, not per variant: picking a smaller-context variant (e.g. gpt-5.5 `272k`) keeps the base model's 1M limit in opencode's context indicator and auto-compaction.
-- A run parked waiting for a tool result keeps its slot. Cursor-model sessions that spawn Cursor-model sub-agents nested deeper than `OPENCODE_CURSOR_MAX_ACTIVE` will stall; raise the limit if you fan out.
+- A run parked waiting for a tool result is released after 10 minutes of silence from opencode, or after 2 hours even while opencode reports the session busy. A tool result arriving later still works: the conversation is replayed into a fresh Cursor agent.
 - Usage/rate limits are whatever your Cursor plan enforces — the plugin adds none beyond the concurrency cap.
 
 ## License
