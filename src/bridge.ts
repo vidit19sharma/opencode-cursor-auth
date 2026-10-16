@@ -13,7 +13,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { markBlocked, resolveVariant } from "./models.js"
 
 // @cursor/sdk has no log-level switch: it prints "HH:MM:SS.mmm INFO ..." through
@@ -387,13 +387,35 @@ const agentByToolCallId = new Map<string, string>()
 let diskSessions = new Map<string, SessionEntry>()
 let sessionsLoaded = false
 
+// Where @cursor/sdk keeps a workspace's agent store and transcripts. The slug mirrors the SDK's
+// utils/workspace-paths; transcripts honour CURSOR_DATA_DIR (used untrimmed, as the SDK does) while the
+// agent store always lives under ~/.cursor. Only ever called for our own tmp workspaces (releaseCwd guard).
+function cursorProjectDirs(cwd: string): string[] {
+  const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "")
+  const dataDir = process.env.CURSOR_DATA_DIR
+  const home = join(homedir(), ".cursor")
+  return [...new Set([join(dataDir?.trim() ? dataDir : home, "projects", slug), join(home, "projects", slug)])]
+}
+
+// a workspace this process could have made with mkdtemp(TMP_CWD_PREFIX), nothing else
+const isOwnWorkspace = (cwd: string) =>
+  resolve(cwd) === cwd && dirname(cwd) === tmpdir() && /^opencode-cursor-[A-Za-z0-9]{6}$/.test(basename(cwd))
+
 // ponytail: no orphan sweep, other opencode instances may own those dirs
-function releaseCwd(cwd: string) {
-  if (!cwd.startsWith(TMP_CWD_PREFIX)) return
+// Once nothing references a workspace, nothing can resume its agent either: delete the agent (after
+// its cancel settles, the SDK refuses while a run is live), Cursor's store and transcript for it, and
+// the workspace.
+function releaseCwd(cwd: string, agentId?: string, settled?: Promise<unknown>) {
+  if (!isOwnWorkspace(cwd)) return
   for (const v of sessions.values()) if (v.cwd === cwd) return
   for (const v of diskSessions.values()) if (v.cwd === cwd) return
   for (const h of heldByAgent.values()) if (h.cwd === cwd) return
-  try { rmSync(cwd, { recursive: true, force: true }) } catch {}
+  void Promise.resolve(settled)
+    .then(() => (agentId ? Agent.delete(agentId, { cwd }) : undefined))
+    .catch(() => {})
+    .finally(() => {
+      for (const dir of [...cursorProjectDirs(cwd), cwd]) try { rmSync(dir, { recursive: true, force: true }) } catch {}
+    })
 }
 
 // scope (opencode session id) is folded in so identical histories from
@@ -428,7 +450,7 @@ async function loadSessions() {
       // can't evict a still-valid 7-day entry; lookup falls back to diskSessions
       if (now - v.lastUsedAt <= DISK_SESSION_TTL_MS) diskSessions.set(k, v)
     }
-    for (const v of Object.values(raw.entries)) if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) releaseCwd(v.cwd)
+    for (const v of Object.values(raw.entries)) if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) releaseCwd(v.cwd, v.agentId)
   } catch {}
 }
 
@@ -459,16 +481,16 @@ function saveSessions() {
 
 function sweepSessions(save = true) {
   const now = Date.now()
-  const evicted: string[] = []
+  const evicted: SessionEntry[] = []
   for (const [k, v] of diskSessions)
     if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) {
       diskSessions.delete(k)
-      evicted.push(v.cwd)
+      evicted.push(v)
     }
   for (const [k, v] of sessions)
     if (now - v.lastUsedAt > SESSION_TTL_MS) {
       sessions.delete(k)
-      evicted.push(v.cwd)
+      evicted.push(v)
     }
   while (sessions.size > MAX_SESSIONS) {
     let oldestKey = ""
@@ -478,10 +500,10 @@ function sweepSessions(save = true) {
         oldest = v.lastUsedAt
         oldestKey = k
       }
-    evicted.push(sessions.get(oldestKey)!.cwd)
+    evicted.push(sessions.get(oldestKey)!)
     sessions.delete(oldestKey)
   }
-  for (const cwd of evicted) releaseCwd(cwd)
+  for (const v of evicted) releaseCwd(v.cwd, v.agentId)
   if (save) saveSessions()
 }
 
@@ -508,7 +530,7 @@ function rememberSession(held: Held, toolCalls: ToolCallOut[]) {
   sessions.set(key, entry)
   diskSessions.set(key, entry)
   sweepSessions()
-  if (displaced && displaced.cwd !== entry.cwd) releaseCwd(displaced.cwd)
+  if (displaced && displaced.cwd !== entry.cwd) releaseCwd(displaced.cwd, displaced.agentId)
 }
 
 async function syncAgentsMd(cwd: string, messages: OaMessage[]) {
@@ -589,7 +611,7 @@ function teardownHeld(held: Held) {
 function failHeld(held: Held, err: unknown) {
   if (isAbort(err)) return abortHeld(held)
   teardownHeld(held)
-  held.run?.cancel().catch(() => {})
+  const cancelled = held.run?.cancel().catch(() => {})
   if (statusFor(err) === 403) markBlocked(held.model)
   if (held.response && !held.opened) {
     held.opened = true
@@ -599,17 +621,17 @@ function failHeld(held: Held, err: unknown) {
     held.sink?.fail(err)
   }
   closeAgent(held)
-  releaseCwd(held.cwd)
+  releaseCwd(held.cwd, held.agent.agentId, cancelled)
 }
 
 function abortHeld(held: Held) {
   if (held.done) return
   teardownHeld(held)
-  held.run?.cancel().catch(() => {})
+  const cancelled = held.run?.cancel().catch(() => {})
   closeAgent(held)
   held.sink?.close()
   held.reply.reject(new DOMException("aborted", "AbortError"))
-  releaseCwd(held.cwd)
+  releaseCwd(held.cwd, held.agent.agentId, cancelled)
 }
 
 /** Model requested tools: emit tool_calls, end this HTTP segment, park the run. */
@@ -744,7 +766,7 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     cwd = entry.cwd
     agent = await withRetry(() => Agent.resume(entry.agentId, agentOptions(cwd!)), signal).catch(() => {
       saveSessions()
-      releaseCwd(entry.cwd)
+      releaseCwd(entry.cwd, entry.agentId)
       return undefined
     })
     if (agent) newSuffix = body.messages.slice(-1)

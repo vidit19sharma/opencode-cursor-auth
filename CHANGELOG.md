@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- Errors are classified by Cursor's backend error code before the SDK class or message: `BAD_API_KEY` / `BAD_USER_API_KEY` → 401, `MODEL_BLOCKED` → 403, and a spent plan (`FREE_USER_USAGE_LIMIT` / `PRO_USER_USAGE_LIMIT`) → new 402 `insufficient_quota`, which is never retried. A 429 carries `retry-after` when Cursor's message names a wait; aborts are never retried. Local system errors (e.g. `EACCES` writing `AGENTS.md`) are 502 and never mark a model blocked. (from #1 by @Dakuaisu)
+- An unwritable or full cache dir made `sessions.json` writes throw, failing turns and throwing from the tool-flush timer; session persistence is now best effort and atomic (temp file, fsync, rename), and workspace removal no longer throws. A failed `AGENTS.md` write now fails the request normally instead of leaking the concurrency slot. A stale model catalog is served immediately and refreshed in the background; a first run with no cache waits at most 15 s. (from #1 by @Dakuaisu)
+- opencode aborted requests after 5 minutes without response headers or between chunks, which a queued request, silent reasoning or a large tool argument could exceed. `headerTimeout` and `chunkTimeout` now default to 30 minutes for the cursor provider (user-set `provider.cursor.options` win). (from #1 by @Dakuaisu)
+- Session resume after a tool-using turn never worked for `cursor/claude-*` models: opencode's `cache_control` tags changed how tool calls serialized a turn later, so every such turn replayed the whole history into a new agent. Tool calls now hash by id, name and arguments. Existing session keys change once. (from #1 by @Dakuaisu)
+- Cursor agents were never deleted: every conversation left an agent plus its store and transcript under `~/.cursor/projects/<workspace>`. When a workspace is released, the bridge now deletes the agent (after any cancel settles) and removes Cursor's project dir along with the workspace; deletion is limited to the bridge's own `opencode-cursor-XXXXXX` temp workspaces. (from #1 by @Dakuaisu)
+
 ## 0.3.3 — 2026-10-16
 
 ### Added

@@ -138,6 +138,7 @@ The models cache is refetched once on upgrade.
 | `~/.cursor/sdk/auth.json` | 90-day SDK key from browser login (written by `@cursor/sdk`) |
 | `~/.cache/opencode-cursor-auth/models.json` | Model catalog, 24h TTL, blocked-model flags |
 | `~/.cache/opencode-cursor-auth/sessions.json` | Conversation → Cursor agent map, 7-day TTL |
+| `~/.cursor/projects/<workspace>` | Cursor's agent store and transcript for each bridge workspace (written by `@cursor/sdk`); removed with the workspace |
 
 ## How it works
 
@@ -149,7 +150,7 @@ opencode ──(OpenAI chat JSON)──> plugin fetch() ──> @cursor/sdk Agen
 - opencode calls the provider's `fetch` — the plugin intercepts it in-process; `http://cursor.local/v1` is a dummy URL that never resolves.
 - Each opencode tool is registered as a Cursor **custom tool** whose `execute()` parks a promise, emits an OpenAI `tool_calls` chunk, and resumes the *same* Cursor run when opencode sends the tool result back.
 - Conversation prefixes, plus the opencode session id (sent via the `chat.headers` hook), are hashed → mapped to Cursor agent IDs, so follow-up turns use `Agent.resume` instead of replaying history. The map persists at `~/.cache/opencode-cursor-auth/sessions.json`.
-- System messages are written to `AGENTS.md` in a per-session temp workspace and loaded via Cursor's project rules (`settingSources: ["project"]`). Workspaces are removed once no session references them.
+- System messages are written to `AGENTS.md` in a per-session temp workspace and loaded via Cursor's project rules (`settingSources: ["project"]`). Once no session references a workspace, the bridge deletes its Cursor agent (`Agent.delete`), Cursor's store and transcript for it under `~/.cursor/projects`, and the workspace itself.
 - The selected variant reaches the plugin as `providerOptions.cursor`; `@ai-sdk/openai-compatible` puts it in the request body as top-level `cursor_params: [{ id, value }, …]`, which the bridge validates and maps to Cursor `ModelSelection.params`.
 - New turns take a slot from a FIFO semaphore (`OPENCODE_CURSOR_MAX_ACTIVE`); tool-result continuations reuse their run's slot. `Agent.create` / `Agent.resume` / `send` are attempted up to 3 times with jittered exponential backoff on 429, 5xx, and network errors, never after the first byte.
 - The HTTP reply opens on the first text or thinking delta, so failures before any content become real HTTP errors.
