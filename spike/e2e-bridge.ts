@@ -3,11 +3,12 @@
  * Test 1: plain streaming chat. Test 2: tool loop (request -> tool_calls ->
  * follow-up request with tool result -> final answer on the SAME cursor run).
  */
-import { _failAfterFirstDelta, _resetForTest, _setBatchSettleMs, _setMaxActive, _stats, handleChatCompletion, isTransient, mapUsage, releaseParked, withRetry } from "../src/bridge.js";
+import { _failAfterFirstDelta, _resetForTest, _sessionEntries, _setBatchSettleMs, _setMaxActive, _stats, forgetSession, handleChatCompletion, isTransient, mapUsage, releaseParked, withRetry } from "../src/bridge.js";
 import { currentModels, resolveModel, resolveVariant } from "../src/models.js";
-import { rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+const runId = Math.random().toString(36).slice(2, 8);
 
 rmSync(join(homedir(), ".cache", "opencode-cursor-auth", "models.json"), { force: true });
 
@@ -174,7 +175,7 @@ else if (res10.status !== 400) throw new Error("Test 7b FAILED: expected 400 for
 
 // --- Test 8: scoped sessions do not collide ---
 console.log("\n=== Test 8: scoped sessions do not collide ===");
-const scopes = ["ses_test_A", "ses_test_B"];
+const scopes = [`ses_test_A_${runId}`, `ses_test_B_${runId}`];
 const messages8 = [
   { role: "system", content: "You are a terse bot. Reply with exactly the single word PING and nothing else." },
   { role: "user", content: "Say the word." },
@@ -567,6 +568,80 @@ if (!(loop21.prompt_tokens > 0)) throw new Error("Test 21 FAILED: zero prompt_to
 if ((loop21.prompt_tokens_details?.cached_tokens ?? 0) > loop21.prompt_tokens) throw new Error("Test 21 FAILED: cached > prompt");
 if (loop21.prompt_tokens >= 2 * base21.prompt_tokens) throw new Error("Test 21 FAILED: tool-loop prompt still looks like the summed run");
 await assertClean("Test 21");
+
+const keysOf = (scope: string) => _sessionEntries().filter(([k]) => k.startsWith(`s:${scope}\u0000`));
+const agentOf = (scope: string, agent: string) => keysOf(scope).find(([k]) => k === `s:${scope}\u0000${agent}`)?.[1].agentId;
+const chat = (messages: Record<string, unknown>[], scope: string, agent: string) =>
+  handleChatCompletion({ model: "gpt-5.5", messages: messages as never, stream: true }, undefined, undefined, scope, agent).then(readSse);
+const ownTmpDirs = () => readdirSync(tmpdir()).filter((n) => /^opencode-cursor-[A-Za-z0-9]{6}$/.test(n)).length;
+async function waitGone(path: string, label: string) {
+  for (let i = 0; i < 50 && existsSync(path); i++) await new Promise((r) => setTimeout(r, 100));
+  if (existsSync(path)) throw new Error(`${label} FAILED: ${path} still exists`);
+}
+
+// --- Test 22: resume across a "restart" while the system prompt drifted ---
+console.log("\n=== Test 22: cross-process resume with system drift ===");
+const sys22 = (p: string) => ({ role: "system", content: `You are A. <location>/tmp/${p}/SKILL.md</location>` });
+const user22 = { role: "user", content: "Remember the word KIWI. Reply OK" };
+const out22a = await chat([sys22("x"), user22], `oca-t22-${runId}`, "main");
+const id22 = agentOf(`oca-t22-${runId}`, "main");
+_resetForTest();
+const out22b = await chat([sys22("y"), user22, { role: "assistant", content: out22a.content }, { role: "user", content: "What word? Just the word." }], `oca-t22-${runId}`, "main");
+console.log("turn 2:", JSON.stringify(out22b.content), "| agentId turn 1:", id22, "| now:", agentOf(`oca-t22-${runId}`, "main"));
+if (!out22b.content.includes("KIWI")) throw new Error("Test 22 FAILED: reply missing KIWI");
+if (!id22 || agentOf(`oca-t22-${runId}`, "main") !== id22) throw new Error("Test 22 FAILED: agent was recreated, not resumed");
+
+// --- Test 23: a title request in the same session does not clobber the main agent ---
+console.log("\n=== Test 23: title request does not clobber ===");
+const user23 = { role: "user", content: "Remember the word PLUM. Reply OK" };
+const out23a = await chat([{ role: "system", content: "You are A." }, user23], `oca-t23-${runId}`, "main");
+const id23 = agentOf(`oca-t23-${runId}`, "main");
+await chat([{ role: "system", content: "Generate a title" }, user23], `oca-t23-${runId}`, "title");
+const out23b = await chat([{ role: "system", content: "You are A." }, user23, { role: "assistant", content: out23a.content }, { role: "user", content: "What word? Just the word." }], `oca-t23-${runId}`, "main");
+console.log("turn 2:", JSON.stringify(out23b.content), "| keys:", keysOf(`oca-t23-${runId}`).length);
+if (!out23b.content.includes("PLUM")) throw new Error("Test 23 FAILED: reply missing PLUM");
+if (!id23 || agentOf(`oca-t23-${runId}`, "main") !== id23) throw new Error("Test 23 FAILED: main agent was recreated");
+if (keysOf(`oca-t23-${runId}`).length !== 2) throw new Error(`Test 23 FAILED: expected 2 entries (main + title), got ${keysOf(`oca-t23-${runId}`).length}`);
+
+// --- Test 24: a tool loop leaves exactly one entry and one workspace ---
+console.log("\n=== Test 24: no stale entries after a tool loop ===");
+const tmp24 = ownTmpDirs();
+const p24 = await park(`oca-t24-${runId}`);
+const out24 = await readSse(await continueWith(withResult(p24.messages, p24.out.toolCalls[0].id, 7741), `oca-t24-${runId}`));
+await assertClean("Test 24");
+console.log("final:", JSON.stringify(out24.content), "| entries:", keysOf(`oca-t24-${runId}`).length, "| tmp dirs:", tmp24, "->", ownTmpDirs());
+if (!out24.content.includes("7741")) throw new Error("Test 24 FAILED: final answer missing 7741");
+if (keysOf(`oca-t24-${runId}`).length !== 1) throw new Error(`Test 24 FAILED: expected 1 entry, got ${keysOf(`oca-t24-${runId}`).length}`);
+if (ownTmpDirs() > tmp24 + 1) throw new Error("Test 24 FAILED: tmp workspaces grew by more than 1");
+
+// --- Test 25: forgetSession releases the entry and its workspace ---
+console.log("\n=== Test 25: forgetSession ===");
+const cwd25 = keysOf(`oca-t24-${runId}`)[0][1].cwd;
+forgetSession(`oca-t24-${runId}`);
+if (keysOf(`oca-t24-${runId}`).length) throw new Error("Test 25 FAILED: entry survived forgetSession");
+await waitGone(cwd25, "Test 25");
+console.log("entry and", cwd25, "gone");
+
+// --- Test 26: startup sweep removes old orphan workspaces and project dirs only ---
+console.log("\n=== Test 26: startup sweep ===");
+const slugOf = (p: string) => join(homedir(), ".cursor", "projects", p.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, ""));
+const [sw1, sw2, sw3] = ["SWEEP1", "SWEEP2", "SWEEP3"].map((s) => join(tmpdir(), `opencode-cursor-${s}`));
+const past = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+for (const d of [sw1, sw2, slugOf(sw1), slugOf(sw3)]) mkdirSync(d, { recursive: true });
+writeFileSync(join(sw1, "AGENTS.md"), "x");
+for (const p of [join(sw1, "AGENTS.md"), sw1, slugOf(sw1), slugOf(sw3)]) utimesSync(p, past, past);
+_resetForTest();
+await assertBridgeOk("Test 26");
+await waitGone(sw1, "Test 26");
+await waitGone(slugOf(sw1), "Test 26");
+await waitGone(slugOf(sw3), "Test 26");
+const kept26 = existsSync(sw2);
+rmSync(sw2, { recursive: true, force: true });
+if (!kept26) throw new Error("Test 26 FAILED: fresh workspace was swept");
+console.log("old workspace + its project dir + orphan project dir swept, fresh workspace kept");
+
+for (const [k] of _sessionEntries()) if (k.startsWith("s:") && k.includes(runId)) forgetSession(k.slice(2).split("\u0000")[0]);
+await new Promise((r) => setTimeout(r, 1500));
 
 console.log("\nALL BRIDGE TESTS PASSED");
 process.exit(0);

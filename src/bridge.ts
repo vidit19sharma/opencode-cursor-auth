@@ -10,7 +10,7 @@
  */
 import { Agent, AuthenticationError, ConfigurationError, NetworkError, RateLimitError, type SDKAgent, type Run } from "@cursor/sdk"
 import { createHash, randomUUID } from "node:crypto"
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs"
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, statSync, writeSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
@@ -338,8 +338,8 @@ function jsonCollector(model: string, resolve: (r: Response) => void): Sink {
   }
 }
 
-// lastPrompt: prompt size of the turn that produced this entry (optional; older entries lack it)
-type SessionEntry = { agentId: string; cwd: string; lastUsedAt: number; lastPrompt?: number }
+// lastPrompt: prompt size of the turn that produced this entry
+type SessionEntry = { agentId: string; cwd: string; prefixHash: string; lastUsedAt: number; lastPrompt?: number }
 
 type Deferred = { promise: Promise<Response>; resolve: (r: Response) => void; reject: (e: unknown) => void }
 
@@ -359,6 +359,7 @@ type Held = {
   model: string
   run: Run | null
   messages: OaMessage[]
+  key: string
   scope?: string
   textAcc: string
   sink: Sink | null
@@ -386,19 +387,18 @@ type Held = {
 
 let batchSettleMs = 300
 const TOOL_RESULT_TIMEOUT_MS = 10 * 60 * 1000
-const SESSION_TTL_MS = 30 * 60 * 1000
-const DISK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
-// ponytail: single-user plugin, small fixed caps; make configurable if ever shared
-const MAX_SESSIONS = 8
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+// ponytail: single-user plugin, fixed cap; make configurable if ever shared
+const MAX_SESSIONS = 256
 const SESSION_STORE_DIR = join(homedir(), ".cache", "opencode-cursor-auth")
 const SESSION_STORE_PATH = join(SESSION_STORE_DIR, "sessions.json")
 const TMP_CWD_PREFIX = join(tmpdir(), "opencode-cursor-")
 
+// key: `s:${opencode session id}\0${agent name}`, or `h:${hashMessages(...)}` when opencode sends no session id
 const sessions = new Map<string, SessionEntry>()
 const heldByAgent = new Map<string, Held>()
 const agentByToolCallId = new Map<string, string>()
-let diskSessions = new Map<string, SessionEntry>()
-let sessionsLoaded = false
+let loading: Promise<void> | undefined
 
 // Where @cursor/sdk keeps a workspace's agent store and transcripts. The slug mirrors the SDK's
 // utils/workspace-paths; transcripts honour CURSOR_DATA_DIR (used untrimmed, as the SDK does) while the
@@ -414,14 +414,12 @@ function cursorProjectDirs(cwd: string): string[] {
 const isOwnWorkspace = (cwd: string) =>
   resolve(cwd) === cwd && dirname(cwd) === tmpdir() && /^opencode-cursor-[A-Za-z0-9]{6}$/.test(basename(cwd))
 
-// ponytail: no orphan sweep, other opencode instances may own those dirs
 // Once nothing references a workspace, nothing can resume its agent either: delete the agent (after
 // its cancel settles, the SDK refuses while a run is live), Cursor's store and transcript for it, and
 // the workspace.
 function releaseCwd(cwd: string, agentId?: string, settled?: Promise<unknown>) {
   if (!isOwnWorkspace(cwd)) return
   for (const v of sessions.values()) if (v.cwd === cwd) return
-  for (const v of diskSessions.values()) if (v.cwd === cwd) return
   for (const h of heldByAgent.values()) if (h.cwd === cwd) return
   void Promise.resolve(settled)
     .then(() => (agentId ? Agent.delete(agentId, { cwd }) : undefined))
@@ -431,40 +429,56 @@ function releaseCwd(cwd: string, agentId?: string, settled?: Promise<unknown>) {
     })
 }
 
-// scope (opencode session id) is folded in so identical histories from
-// different sessions (e.g. parallel sub-agents) never share a Cursor agent.
-// Tool calls hash by id/name/arguments only: opencode tags the last two messages with
-// cache_control for claude-* ids, so the same call serializes differently a turn later.
-function hashMessages(messages: OaMessage[], scope?: string): string {
-  const norm: unknown[] = messages.map((m) => [m.role, textOf(m.content), m.tool_call_id ?? "", (m.tool_calls ?? []).map((c) => [c.id, c.function?.name, c.function?.arguments])])
-  if (scope) norm.unshift(["scope", scope])
+// System messages are left out: opencode's system prompt differs per process (skill paths), the
+// conversation itself is byte-stable. Tool calls hash by id/name/arguments only: opencode tags the last
+// two messages with cache_control for claude-* ids, so the same call serializes differently a turn later.
+function hashMessages(messages: OaMessage[]): string {
+  const norm = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => [m.role, textOf(m.content), m.tool_call_id ?? "", (m.tool_calls ?? []).map((c) => [c.id, c.function?.name, c.function?.arguments])])
   return createHash("sha256").update(JSON.stringify(norm)).digest("hex")
 }
 
-function collectDiskEntries(): Record<string, SessionEntry> {
-  const now = Date.now()
-  const entries: Record<string, SessionEntry> = {}
-  for (const [k, v] of diskSessions) if (now - v.lastUsedAt <= DISK_SESSION_TTL_MS) entries[k] = v
-  return entries
+const loadSessions = () => (loading ??= doLoadSessions())
+
+async function doLoadSessions() {
+  try {
+    const raw = JSON.parse(await readFile(SESSION_STORE_PATH, "utf8")) as { version?: number; entries?: Record<string, SessionEntry> }
+    // v1 (<= 0.3.4) keys hashed the system prompt, so none can match again; its workspaces are left to
+    // sweepOrphans rather than released here, an older opencode process may still be using them
+    if (raw.version === 2) for (const [k, v] of Object.entries(raw.entries ?? {})) sessions.set(k, v)
+  } catch {}
+  sweepOrphans()
+  sweepSessions()
 }
 
-async function loadSessions() {
-  if (sessionsLoaded) return
-  sessionsLoaded = true
+// Workspaces/project dirs no entry references, untouched for SESSION_TTL_MS. Age is the newest of the dir's and
+// its AGENTS.md's mtime: any live opencode process (this or another) rewrites AGENTS.md every turn.
+function sweepOrphans() {
+  const old = (p: string) => {
+    try {
+      return Date.now() - Math.max(statSync(p).mtimeMs, statSync(join(p, "AGENTS.md"), { throwIfNoEntry: false })?.mtimeMs ?? 0) > SESSION_TTL_MS
+    } catch {
+      return false
+    }
+  }
+  const live = new Set([...sessions.values(), ...heldByAgent.values()].flatMap((v) => [v.cwd, ...cursorProjectDirs(v.cwd)]))
   try {
-    const raw = JSON.parse(await readFile(SESSION_STORE_PATH, "utf8")) as {
-      version?: number
-      entries?: Record<string, SessionEntry>
+    for (const name of readdirSync(tmpdir())) {
+      const p = join(tmpdir(), name)
+      if (/^opencode-cursor-[A-Za-z0-9]{6}$/.test(name) && !live.has(p) && old(p)) releaseCwd(p)
     }
-    if (raw.version !== 1 || !raw.entries) return
-    const now = Date.now()
-    for (const [k, v] of Object.entries(raw.entries)) {
-      // disk entries stay out of the 30-min memory map so the memory sweep
-      // can't evict a still-valid 7-day entry; lookup falls back to diskSessions
-      if (now - v.lastUsedAt <= DISK_SESSION_TTL_MS) diskSessions.set(k, v)
-    }
-    for (const v of Object.values(raw.entries)) if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) releaseCwd(v.cwd, v.agentId)
   } catch {}
+  const dataDir = process.env.CURSOR_DATA_DIR
+  for (const root of new Set([join(homedir(), ".cursor", "projects"), ...(dataDir?.trim() ? [join(dataDir, "projects")] : [])])) {
+    try {
+      for (const name of readdirSync(root)) {
+        const id = name.match(/-opencode-cursor-([A-Za-z0-9]{6})$/)?.[1]
+        const p = join(root, name)
+        if (id && !live.has(p) && !existsSync(TMP_CWD_PREFIX + id) && old(p)) rmSync(p, { recursive: true, force: true })
+      }
+    } catch {}
+  }
 }
 
 let warnedSave = false
@@ -477,7 +491,7 @@ function saveSessions() {
     mkdirSync(SESSION_STORE_DIR, { recursive: true })
     const fd = openSync(tmp, "w")
     try {
-      writeSync(fd, JSON.stringify({ version: 1, entries: collectDiskEntries() }))
+      writeSync(fd, JSON.stringify({ version: 2, entries: Object.fromEntries(sessions) }))
       fsyncSync(fd)
     } finally {
       closeSync(fd)
@@ -492,14 +506,9 @@ function saveSessions() {
   }
 }
 
-function sweepSessions(save = true) {
+function sweepSessions() {
   const now = Date.now()
   const evicted: SessionEntry[] = []
-  for (const [k, v] of diskSessions)
-    if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) {
-      diskSessions.delete(k)
-      evicted.push(v)
-    }
   for (const [k, v] of sessions)
     if (now - v.lastUsedAt > SESSION_TTL_MS) {
       sessions.delete(k)
@@ -517,13 +526,12 @@ function sweepSessions(save = true) {
     sessions.delete(oldestKey)
   }
   for (const v of evicted) releaseCwd(v.cwd, v.agentId)
-  if (save) saveSessions()
+  saveSessions()
 }
 
 /**
- * Re-key the session under the conversation state the NEXT request will
- * present (current messages + the assistant message we just produced), since
- * session-unaware clients like opencode resend full history every turn.
+ * Record the conversation state the NEXT request will present (current messages + the assistant
+ * message we just produced) as the entry's prefixHash, since opencode resends full history every turn.
  */
 function rememberSession(held: Held, toolCalls: ToolCallOut[]) {
   const assistant: OaMessage = {
@@ -533,18 +541,21 @@ function rememberSession(held: Held, toolCalls: ToolCallOut[]) {
       ? { tool_calls: toolCalls.map((c) => ({ id: c.id, function: { name: c.name, arguments: c.argumentsJson } })) }
       : {}),
   }
-  const key = hashMessages(held.messages.concat(assistant), held.scope)
-  const entry = {
+  const prefixHash = hashMessages(held.messages.concat(assistant))
+  if (held.key.startsWith("h:")) {
+    sessions.delete(held.key)
+    held.key = `h:${prefixHash}`
+  }
+  const old = sessions.get(held.key)
+  sessions.set(held.key, {
     agentId: held.agent.agentId,
     cwd: held.cwd,
+    prefixHash,
     lastUsedAt: Date.now(),
     ...(held.lastPrompt ? { lastPrompt: held.lastPrompt } : {}),
-  }
-  const displaced = sessions.get(key) ?? diskSessions.get(key)
-  sessions.set(key, entry)
-  diskSessions.set(key, entry)
+  })
+  if (old && old.cwd !== held.cwd) releaseCwd(old.cwd, old.agentId)
   sweepSessions()
-  if (displaced && displaced.cwd !== entry.cwd) releaseCwd(displaced.cwd, displaced.agentId)
 }
 
 async function syncAgentsMd(cwd: string, messages: OaMessage[]) {
@@ -646,7 +657,8 @@ function failHeld(held: Held, err: unknown) {
   if (isAbort(err)) return abortHeld(held)
   teardownHeld(held)
   const cancelled = held.run?.cancel().catch(() => {})
-  if (statusFor(err) === 403) markBlocked(held.model)
+  const e = err as { code?: unknown; message?: unknown } | null
+  if (e?.code === "MODEL_BLOCKED" || /model blocked/i.test(String(e?.message ?? err))) markBlocked(held.model)
   if (held.response && !held.opened) {
     held.opened = true
     held.reply.resolve(errorResponse(err))
@@ -697,6 +709,17 @@ export function releaseParked(scope: string) {
   }
 }
 
+/** opencode session deleted: nothing can resume its agents, release them and their workspaces now. */
+export function forgetSession(sessionID: string) {
+  for (const [k, v] of sessions)
+    if (k.startsWith(`s:${sessionID}\u0000`)) {
+      sessions.delete(k)
+      releaseCwd(v.cwd, v.agentId)
+    }
+  releaseParked(sessionID)
+  saveSessions()
+}
+
 async function wireRunCompletion(held: Held) {
   if (held.wired || !held.run) return
   held.wired = true
@@ -721,11 +744,12 @@ async function wireRunCompletion(held: Held) {
 
 export function _resetForTest() {
   sessions.clear()
-  diskSessions.clear()
   heldByAgent.clear()
   agentByToolCallId.clear()
-  sessionsLoaded = false
+  loading = undefined
 }
+
+export const _sessionEntries = () => [...sessions]
 
 let failAfterFirstDelta: string | null = null
 export function _failAfterFirstDelta(message: string | null) {
@@ -736,14 +760,13 @@ export function _stats() {
   return {
     held: heldByAgent.size,
     sessions: sessions.size,
-    disk: diskSessions.size,
     agentIds: [...sessions.values()].map((v) => v.agentId).sort(),
     active,
     waiting: waiters.length + priorityWaiters.length,
   }
 }
 
-export async function handleChatCompletion(body: OaBody, apiKey?: string, signal?: AbortSignal, scope?: string): Promise<Response> {
+export async function handleChatCompletion(body: OaBody, apiKey?: string, signal?: AbortSignal, scope?: string, agentName?: string): Promise<Response> {
   if (signal?.aborted) throw new DOMException("aborted", "AbortError")
   ensureQuietConsole()
   await loadSessions()
@@ -807,15 +830,15 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   const model = resolveVariant(body.model, body.cursor_params) ?? { id: body.model }
   if (typeof model === "string") return errorResponse(model, 400)
 
-  // new turn: reuse the agent whose last-seen conversation matches our prefix
-  const prefix = body.messages.slice(0, -1)
-  const key = hashMessages(prefix, scope)
+  // new turn: reuse this session's agent if its last-seen conversation is our prefix
+  const prefixHash = hashMessages(body.messages.slice(0, -1))
+  const key = scope ? `s:${scope}\u0000${agentName ?? ""}` : `h:${prefixHash}`
   await acquireSlot(signal)
-  // expired tool call: its run is gone, so a fresh agent gets the whole history (tool results included)
-  let entry = sessions.get(key) ?? diskSessions.get(key)
-  if (entry && replay) {
+  // expired tool call: its run is gone, so a fresh agent gets the whole history (tool results included).
+  // A prefix mismatch means history was edited or compacted: same thing.
+  let entry = sessions.get(key)
+  if (entry && (replay || entry.prefixHash !== prefixHash)) {
     sessions.delete(key)
-    diskSessions.delete(key)
     saveSessions()
     releaseCwd(entry.cwd, entry.agentId)
     entry = undefined
@@ -831,23 +854,34 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     local: { cwd, settingSources: ["project"] as ["project"], enableAgentRetries: true },
   })
   if (entry) {
+    const e = entry
+    try {
+      agent = await withRetry(() => Agent.resume(e.agentId, agentOptions(e.cwd)), signal)
+      cwd = e.cwd
+      newSuffix = body.messages.slice(-1)
+    } catch (err) {
+      // aborted, bad key or rate limited: the agent is fine, keep the entry for the next attempt
+      if (signal?.aborted || isAbort(err)) {
+        releaseSlot()
+        throw abortError()
+      }
+      const status = statusFor(err)
+      if (status === 401 || status === 429) {
+        releaseSlot()
+        return errorResponse(err, status)
+      }
+    }
     sessions.delete(key)
-    diskSessions.delete(key)
-    cwd = entry.cwd
-    agent = await withRetry(() => Agent.resume(entry.agentId, agentOptions(cwd!)), signal).catch(() => {
-      saveSessions()
-      releaseCwd(entry.cwd, entry.agentId)
-      return undefined
-    })
-    if (agent) newSuffix = body.messages.slice(-1)
+    saveSessions()
+    if (!agent) releaseCwd(e.cwd, e.agentId)
   }
   if (!agent) {
-    cwd = await mkdtemp(TMP_CWD_PREFIX)
     try {
+      cwd = await mkdtemp(TMP_CWD_PREFIX)
       agent = await withRetry(() => Agent.create(agentOptions(cwd!)), signal)
     } catch (err) {
       releaseSlot()
-      releaseCwd(cwd)
+      if (cwd) releaseCwd(cwd)
       if (signal?.aborted || isAbort(err)) throw abortError()
       return errorResponse(err)
     }
@@ -859,6 +893,7 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     model: body.model,
     run: null,
     messages: body.messages,
+    key,
     scope,
     textAcc: "",
     sink: null,
