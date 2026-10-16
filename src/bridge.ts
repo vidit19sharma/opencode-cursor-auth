@@ -10,7 +10,7 @@
  */
 import { Agent, AuthenticationError, ConfigurationError, NetworkError, RateLimitError, type SDKAgent, type Run } from "@cursor/sdk"
 import { createHash, randomUUID } from "node:crypto"
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
@@ -84,13 +84,24 @@ type Sink = {
 
 type ErrorBody = { error: { message: string; type: string; code?: string } }
 
+// err.code is Cursor's backend error name (MODEL_BLOCKED, PRO_USER_USAGE_LIMIT, ...) when the SDK has
+// one. The SDK files a bad key under ConfigurationError and a spent plan under RateLimitError, so the
+// code decides those before the class does.
+const KEY_CODES = new Set(["BAD_API_KEY", "BAD_USER_API_KEY", "unauthenticated"])
+const USAGE_LIMIT_CODES = new Set(["FREE_USER_USAGE_LIMIT", "PRO_USER_USAGE_LIMIT"])
+
 function statusFor(err: unknown): number {
-  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown }
+  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; syscall?: unknown }
+  // a local failure (EACCES writing AGENTS.md says "permission denied") is not Cursor's verdict on the
+  // model, and a 403 would mark the model blocked
+  if (typeof e.syscall === "string") return 502
   const msg = String(e.message ?? err ?? "")
   const code = typeof e.code === "string" ? e.code : ""
-  if (err instanceof AuthenticationError || e.status === 401 || code === "unauthenticated" || /invalid user api key/i.test(msg)) return 401
+  if (err instanceof AuthenticationError || e.status === 401 || KEY_CODES.has(code) || /invalid user api key/i.test(msg)) return 401
+  // 402, not 429: opencode retries a 429, and waiting does not refill a plan's included usage
+  if (USAGE_LIMIT_CODES.has(code)) return 402
   if (err instanceof RateLimitError || e.status === 429 || code === "resource_exhausted" || /rate limit/i.test(msg)) return 429
-  if (code === "permission_denied" || /model blocked|permission denied|forbidden/i.test(msg)) return 403
+  if (code === "MODEL_BLOCKED" || code === "permission_denied" || /model blocked|permission denied|forbidden/i.test(msg)) return 403
   if (err instanceof ConfigurationError || code === "invalid_argument" || code === "not_found" || /cannot use this model|unknown model/i.test(msg)) return 400
   return 502
 }
@@ -98,8 +109,18 @@ function statusFor(err: unknown): number {
 const ERROR_TYPE: Record<number, string> = {
   400: "invalid_request_error",
   401: "authentication_error",
+  402: "insufficient_quota",
   403: "permission_error",
   429: "rate_limit_error",
+}
+
+// "try again in 30 seconds" / "resets in 2h": tell opencode how long to wait instead of letting it guess
+function retryAfterSeconds(msg: string): number | undefined {
+  const m = msg.match(/\b(?:in|after)\s+(\d+(?:\.\d+)?)\s*(ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b/i)
+  if (!m) return undefined
+  const unit = m[2].toLowerCase()
+  const factor = unit === "ms" ? 0.001 : unit.startsWith("s") ? 1 : unit.startsWith("m") ? 60 : 3600
+  return Math.max(1, Math.ceil(Number(m[1]) * factor))
 }
 
 function errorBody(err: unknown, status = statusFor(err)): ErrorBody {
@@ -117,12 +138,13 @@ const abortError = () => new DOMException("aborted", "AbortError")
 const isAbort = (err: unknown) => (err as { name?: unknown } | null)?.name === "AbortError"
 
 export function isTransient(err: unknown): boolean {
-  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; name?: unknown }
-  if (e.name === "AbortError") return false
+  const e = (typeof err === "object" && err !== null ? err : {}) as { message?: unknown; code?: unknown; status?: unknown; name?: unknown; isRetryable?: unknown }
+  if (e.name === "AbortError" || e.code === "ABORT_ERR") return false
   const status = statusFor(err)
   if (status === 429) return true
-  if (status === 400 || status === 401 || status === 403 || e.status === 404) return false
-  if (err instanceof NetworkError || (typeof e.status === "number" && e.status >= 500)) return true
+  if (status === 400 || status === 401 || status === 402 || status === 403 || e.status === 404) return false
+  // isRetryable is the backend's own flag; the SDK defaults it to false when none was sent, so only true counts
+  if (e.isRetryable === true || err instanceof NetworkError || (typeof e.status === "number" && e.status >= 500)) return true
   return /unavailable|deadline_exceeded|ECONNRESET|ETIMEDOUT|fetch failed/i.test(`${e.code ?? ""} ${e.message ?? ""}`)
 }
 
@@ -143,7 +165,8 @@ export async function withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal, b
   }
 }
 
-// ponytail: global semaphore, slot held across parked tool loops; per-session fairness if it ever matters
+// ponytail: global semaphore over generating runs; per-session fairness if it ever matters. A run parked
+// on tool results gives its slot back, so a parent waiting on a Cursor sub-agent can never starve it.
 let maxActive = Number(process.env.OPENCODE_CURSOR_MAX_ACTIVE) || 4
 let active = 0
 const waiters: (() => void)[] = []
@@ -155,7 +178,8 @@ function pump() {
   }
 }
 
-function acquireSlot(signal?: AbortSignal): Promise<void> {
+// first: a parked run's continuation, whose turn is already under way, jumps the queue
+function acquireSlot(signal?: AbortSignal, first = false): Promise<void> {
   if (signal?.aborted) return Promise.reject(abortError())
   if (active < maxActive && !waiters.length) {
     active++
@@ -172,7 +196,8 @@ function acquireSlot(signal?: AbortSignal): Promise<void> {
       resolve()
     }
     signal?.addEventListener("abort", onAbort, { once: true })
-    waiters.push(go)
+    if (first) waiters.unshift(go)
+    else waiters.push(go)
   })
 }
 
@@ -187,7 +212,9 @@ export function _setMaxActive(n: number) {
 }
 
 export function errorResponse(err: unknown, status = statusFor(err)): Response {
-  return Response.json(errorBody(err, status), { status })
+  const body = errorBody(err, status)
+  const wait = status === 429 ? retryAfterSeconds(body.error.message) : undefined
+  return Response.json(body, { status, ...(wait ? { headers: { "retry-after": String(wait) } } : {}) })
 }
 
 function chunk(id: string, model: string, delta: Record<string, unknown>, finish: string | null, usage?: Usage) {
@@ -323,6 +350,7 @@ function deferred(): Deferred {
 type Held = {
   agent: SDKAgent
   cwd: string
+  apiKey?: string
   model: string
   run: Run | null
   messages: OaMessage[]
@@ -341,13 +369,20 @@ type Held = {
   flushTimer: ReturnType<typeof setTimeout> | null
   idleTimer: ReturnType<typeof setTimeout> | null
   usage?: Usage
+  modelCalls: number
   wired: boolean
   done: boolean
   slot: boolean
+  // the prompt reached Cursor, so the agent's history moved on (see abortHeld)
+  sent: boolean
+  // session entry consumed to resume this agent, put back if the turn fails before any output
+  restore?: { key: string; entry: SessionEntry }
 }
 
 const BATCH_SETTLE_MS = 300
-const TOOL_RESULT_TIMEOUT_MS = 10 * 60 * 1000
+// Backstop only: releaseSession frees a parked run as soon as opencode goes idle on its session, and a
+// tool result can legitimately take long (sub-agent, permission prompt, question to the user).
+const TOOL_RESULT_TIMEOUT_MS = 2 * 60 * 60 * 1000
 const SESSION_TTL_MS = 30 * 60 * 1000
 const DISK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 // ponytail: single-user plugin, small fixed caps; make configurable if ever shared
@@ -362,19 +397,74 @@ const agentByToolCallId = new Map<string, string>()
 let diskSessions = new Map<string, SessionEntry>()
 let sessionsLoaded = false
 
+let notice: ((message: string) => void) | undefined
+/** Where user-facing notices go; plugin.ts points this at opencode's toast. */
+export function setNotice(fn: (message: string) => void) {
+  notice = fn
+}
+
+// opencode prices a step as tokens × model.cost and lets no provider report a real cost (only Copilot's),
+// and Cursor bills plan-included usage at $0. So charges beyond the plan surface as a notice, from what
+// Cursor has billed each agent (cents, as last seen; billing lands a few seconds after a run ends).
+const CHARGE_CHECK_DELAY_MS = 10_000
+const chargedCents = new Map<string, number>()
+let billingUnavailable = false
+
+function checkCharges(agentId: string, apiKey: string | undefined, baselineOnly = false) {
+  if (billingUnavailable) return
+  Agent.getUsage(agentId, apiKey ? { apiKey } : undefined).then(
+    ({ cost }) => {
+      if (!cost) return
+      const before = chargedCents.get(agentId)
+      chargedCents.set(agentId, cost.chargedCents)
+      if (baselineOnly || before === undefined || cost.chargedCents <= before) return
+      const dollars = (cents: number) => `$${(cents / 100).toFixed(2)}`
+      const message = `Cursor billed ${dollars(cost.chargedCents - before)} on-demand for the last turn (${dollars(cost.chargedCents)} in this conversation)`
+      console.error(`[opencode-cursor-auth] ${message}`)
+      notice?.(message)
+    },
+    (err) => {
+      // accounts without billing access answer "[feature_unavailable] ..." every time
+      const e = (err ?? {}) as { code?: unknown; message?: unknown }
+      if (/feature_unavailable/.test(`${e.code ?? ""} ${e.message ?? ""}`)) billingUnavailable = true
+    },
+  )
+}
+
+// where @cursor/sdk keeps a workspace's agent store and transcripts (its utils/workspace-paths.ts slug)
+function cursorProjectDir(cwd: string): string {
+  const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "")
+  return join(process.env.CURSOR_DATA_DIR?.trim() || join(homedir(), ".cursor"), "projects", slug)
+}
+
 // ponytail: no orphan sweep, other opencode instances may own those dirs
-function releaseCwd(cwd: string) {
+// Once nothing references a workspace, nothing can resume its agent either: delete the agent (after
+// its cancel settles, the SDK refuses while a run is live), Cursor's store and transcript for it, and
+// the workspace.
+function releaseCwd(cwd: string, agentId?: string, settled?: Promise<unknown>) {
   if (!cwd.startsWith(TMP_CWD_PREFIX)) return
   for (const v of sessions.values()) if (v.cwd === cwd) return
   for (const v of diskSessions.values()) if (v.cwd === cwd) return
   for (const h of heldByAgent.values()) if (h.cwd === cwd) return
-  rmSync(cwd, { recursive: true, force: true })
+  if (agentId) chargedCents.delete(agentId)
+  void Promise.resolve(settled)
+    .then(() => (agentId ? Agent.delete(agentId, { cwd }) : undefined))
+    .catch(() => {})
+    .finally(() => {
+      for (const dir of [cursorProjectDir(cwd), cwd]) try { rmSync(dir, { recursive: true, force: true }) } catch {}
+    })
 }
 
 // scope (opencode session id) is folded in so identical histories from
-// different sessions (e.g. parallel sub-agents) never share a Cursor agent
+// different sessions (e.g. parallel sub-agents) never share a Cursor agent.
+// Tool calls hash by id/name/arguments only: opencode tags the last two messages with
+// cache_control for claude-* ids, so the same call serializes differently a turn later.
+// With a scope, system text stays out too: it changes on its own (opencode puts today's
+// date in it) and reaches the agent through AGENTS.md on every turn anyway.
 function hashMessages(messages: OaMessage[], scope?: string): string {
-  const norm: unknown[] = messages.map((m) => [m.role, textOf(m.content), m.tool_call_id ?? "", JSON.stringify(m.tool_calls ?? null)])
+  const norm: unknown[] = messages
+    .filter((m) => !scope || m.role !== "system")
+    .map((m) => [m.role, textOf(m.content), m.tool_call_id ?? "", (m.tool_calls ?? []).map((c) => [c.id, c.function?.name, c.function?.arguments])])
   if (scope) norm.unshift(["scope", scope])
   return createHash("sha256").update(JSON.stringify(norm)).digest("hex")
 }
@@ -401,27 +491,47 @@ async function loadSessions() {
       // can't evict a still-valid 7-day entry; lookup falls back to diskSessions
       if (now - v.lastUsedAt <= DISK_SESSION_TTL_MS) diskSessions.set(k, v)
     }
-    for (const v of Object.values(raw.entries)) if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) releaseCwd(v.cwd)
+    for (const v of Object.values(raw.entries)) if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) releaseCwd(v.cwd, v.agentId)
   } catch {}
 }
 
+let warnedSave = false
+
+// Best effort: a read-only or full cache dir must never fail or hang a request, it only costs resume
+// after a restart. Written via rename so a crash mid-write can't leave torn JSON behind.
 function saveSessions() {
-  mkdirSync(SESSION_STORE_DIR, { recursive: true })
-  writeFileSync(SESSION_STORE_PATH, JSON.stringify({ version: 1, entries: collectDiskEntries() }))
+  const tmp = `${SESSION_STORE_PATH}.${randomUUID()}.tmp`
+  try {
+    mkdirSync(SESSION_STORE_DIR, { recursive: true })
+    const fd = openSync(tmp, "w")
+    try {
+      writeSync(fd, JSON.stringify({ version: 1, entries: collectDiskEntries() }))
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, SESSION_STORE_PATH)
+  } catch (err) {
+    try { rmSync(tmp, { force: true }) } catch {}
+    if (!warnedSave) {
+      warnedSave = true
+      console.error(`[opencode-cursor-auth] could not save ${SESSION_STORE_PATH}, sessions resume only until restart: ${(err as Error).message}`)
+    }
+  }
 }
 
 function sweepSessions(save = true) {
   const now = Date.now()
-  const evicted: string[] = []
+  const evicted: SessionEntry[] = []
   for (const [k, v] of diskSessions)
     if (now - v.lastUsedAt > DISK_SESSION_TTL_MS) {
       diskSessions.delete(k)
-      evicted.push(v.cwd)
+      evicted.push(v)
     }
   for (const [k, v] of sessions)
     if (now - v.lastUsedAt > SESSION_TTL_MS) {
       sessions.delete(k)
-      evicted.push(v.cwd)
+      evicted.push(v)
     }
   while (sessions.size > MAX_SESSIONS) {
     let oldestKey = ""
@@ -431,10 +541,10 @@ function sweepSessions(save = true) {
         oldest = v.lastUsedAt
         oldestKey = k
       }
-    evicted.push(sessions.get(oldestKey)!.cwd)
+    evicted.push(sessions.get(oldestKey)!)
     sessions.delete(oldestKey)
   }
-  for (const cwd of evicted) releaseCwd(cwd)
+  for (const v of evicted) releaseCwd(v.cwd, v.agentId)
   if (save) saveSessions()
 }
 
@@ -451,17 +561,42 @@ function rememberSession(held: Held, toolCalls: ToolCallOut[]) {
       ? { tool_calls: toolCalls.map((c) => ({ id: c.id, function: { name: c.name, arguments: c.argumentsJson } })) }
       : {}),
   }
-  const key = hashMessages(held.messages.concat(assistant), held.scope)
-  const entry = {
-    agentId: held.agent.agentId,
-    cwd: held.cwd,
-    lastUsedAt: Date.now(),
-  }
+  rememberState(held, held.messages.concat(assistant))
+}
+
+function rememberState(held: Held, messages: OaMessage[]) {
+  remember(hashMessages(messages, held.scope), { agentId: held.agent.agentId, cwd: held.cwd, lastUsedAt: Date.now() })
+}
+
+// One key per agent: an agent only ever sits at its latest state, so an older key (a parked
+// tool-call state, a reverted turn) must not resume it.
+function remember(key: string, entry: SessionEntry) {
+  for (const map of [sessions, diskSessions]) for (const [k, v] of map) if (v.agentId === entry.agentId && k !== key) map.delete(k)
   const displaced = sessions.get(key) ?? diskSessions.get(key)
   sessions.set(key, entry)
   diskSessions.set(key, entry)
   sweepSessions()
-  if (displaced && displaced.cwd !== entry.cwd) releaseCwd(displaced.cwd)
+  if (displaced && displaced.cwd !== entry.cwd) releaseCwd(displaced.cwd, displaced.agentId)
+}
+
+/**
+ * The agent whose last-seen state is a prefix of messages, and the messages it hasn't seen: normally
+ * all but the last. Tool results whose run is gone (backstop, Esc, laptop sleep), plus maybe a new
+ * user message, resume from the tool-call message they answer, the state that run parked in.
+ */
+function findSession(messages: OaMessage[], scope?: string): { key: string; entry: SessionEntry; suffix: OaMessage[] } | undefined {
+  const at = (n: number) => {
+    const key = hashMessages(messages.slice(0, n), scope)
+    const entry = sessions.get(key) ?? diskSessions.get(key)
+    return entry && { key, entry, suffix: messages.slice(n) }
+  }
+  const found = at(messages.length - 1)
+  if (found) return found
+  let i = messages.length - 1
+  if (messages[i]?.role === "user") i--
+  const lastTool = i
+  while (i >= 0 && messages[i].role === "tool") i--
+  return i >= 0 && i < lastTool && messages[i].tool_calls?.length ? at(i + 1) : undefined
 }
 
 async function syncAgentsMd(cwd: string, messages: OaMessage[]) {
@@ -476,18 +611,25 @@ async function syncAgentsMd(cwd: string, messages: OaMessage[]) {
   else if (existsSync(path)) rmSync(path)
 }
 
+// A Cursor turn spans every model call of its agent loop (one per tool round trip), and its usage sums
+// them, re-counting the whole context each call. opencode reads a step's usage as the context size
+// (meter, auto-compaction), so report the per-call average rather than the N-fold sum.
 function mapUsage(u?: {
   inputTokens?: number
   outputTokens?: number
   cacheReadTokens?: number
+  cacheWriteTokens?: number
   reasoningTokens?: number
-}): Usage | undefined {
+}, modelCalls = 1): Usage | undefined {
   if (!u) return undefined
-  const prompt = u.inputTokens ?? 0
-  const completion = u.outputTokens ?? 0
+  const per = (n?: number) => Math.round((n ?? 0) / Math.max(1, modelCalls))
+  // Cursor's inputTokens exclude cache reads/writes (its totalTokens adds them); OpenAI's prompt_tokens
+  // include them, and opencode derives uncached input as prompt_tokens - cached_tokens
+  const prompt = per(u.inputTokens) + per(u.cacheReadTokens) + per(u.cacheWriteTokens)
+  const completion = per(u.outputTokens)
   const usage: Usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
-  if (u.cacheReadTokens) usage.prompt_tokens_details = { cached_tokens: u.cacheReadTokens }
-  if (u.reasoningTokens) usage.completion_tokens_details = { reasoning_tokens: u.reasoningTokens }
+  if (u.cacheReadTokens) usage.prompt_tokens_details = { cached_tokens: per(u.cacheReadTokens) }
+  if (u.reasoningTokens) usage.completion_tokens_details = { reasoning_tokens: per(u.reasoningTokens) }
   return usage
 }
 
@@ -500,6 +642,7 @@ function emit(held: Held, kind: "text" | "reasoning", t: string) {
 function openReply(held: Held) {
   if (held.opened) return
   held.opened = true
+  held.restore = undefined
   if (held.response) held.reply.resolve(held.response)
 }
 
@@ -508,6 +651,8 @@ function attachSink(held: Held, sink: Sink) {
   if (held.buffer.length) openReply(held)
   for (const b of held.buffer) (b.kind === "text" ? sink.text : sink.reasoning)(b.t)
   held.buffer = []
+  // tool calls that arrived after the last segment closed go out on this one
+  if (held.pendingCalls.length && !held.flushTimer) held.flushTimer = setTimeout(() => flushToolCalls(held), BATCH_SETTLE_MS)
 }
 
 function attachSignal(held: Held, signal: AbortSignal | undefined) {
@@ -542,7 +687,7 @@ function teardownHeld(held: Held) {
 function failHeld(held: Held, err: unknown) {
   if (isAbort(err)) return abortHeld(held)
   teardownHeld(held)
-  held.run?.cancel().catch(() => {})
+  const cancelled = held.run?.cancel().catch(() => {})
   if (statusFor(err) === 403) markBlocked(held.model)
   if (held.response && !held.opened) {
     held.opened = true
@@ -552,23 +697,39 @@ function failHeld(held: Held, err: unknown) {
     held.sink?.fail(err)
   }
   closeAgent(held)
-  releaseCwd(held.cwd)
+  // the client's retry resends this exact request, so let it resume the same agent
+  if (held.restore) remember(held.restore.key, held.restore.entry)
+  releaseCwd(held.cwd, held.agent.agentId, cancelled)
 }
 
 function abortHeld(held: Held) {
   if (held.done) return
+  const parked = !held.sink
   teardownHeld(held)
-  held.run?.cancel().catch(() => {})
+  const cancelled = held.run?.cancel().catch(() => {})
   closeAgent(held)
   held.sink?.close()
   held.reply.reject(new DOMException("aborted", "AbortError"))
-  releaseCwd(held.cwd)
+  // Keep the agent resumable from where opencode's history will stand: a parked run keeps its
+  // tool-call key; a cancelled segment ends with the text opencode already shows (opencode drops
+  // an aborted reply that showed none); a turn that never reached Cursor gets its entry back.
+  if (!parked) {
+    if (held.sent) rememberState(held, held.textAcc ? held.messages.concat({ role: "assistant", content: held.textAcc }) : held.messages)
+    else if (held.restore) remember(held.restore.key, held.restore.entry)
+  }
+  releaseCwd(held.cwd, held.agent.agentId, cancelled)
+}
+
+/** opencode went idle on this session, so a run still parked on its tool results will never get them. */
+export function releaseSession(scope: string) {
+  for (const held of [...heldByAgent.values()]) if (held.scope === scope && !held.sink) abortHeld(held)
 }
 
 /** Model requested tools: emit tool_calls, end this HTTP segment, park the run. */
 function flushToolCalls(held: Held) {
   held.flushTimer = null
-  if (held.done || !held.pendingCalls.length) return
+  // a call that arrives after the segment closed waits for the next one (see attachSink)
+  if (held.done || !held.sink || !held.pendingCalls.length) return
   const calls = held.pendingCalls
   held.pendingCalls = []
   for (const c of calls) agentByToolCallId.set(c.id, held.agent.agentId)
@@ -578,10 +739,16 @@ function flushToolCalls(held: Held) {
   // reach it; the continuation request attaches its own
   held.detachSignal?.()
   held.detachSignal = null
+  // parked, the run generates nothing until opencode answers
+  if (held.slot) {
+    held.slot = false
+    releaseSlot()
+  }
   openReply(held)
-  sink?.toolCalls(calls)
-  sink?.finish("tool_calls")
+  sink.toolCalls(calls)
+  sink.finish("tool_calls", held.usage)
   rememberSession(held, calls)
+  if (held.idleTimer) clearTimeout(held.idleTimer)
   held.idleTimer = setTimeout(() => abortHeld(held), TOOL_RESULT_TIMEOUT_MS)
   held.idleTimer.unref?.()
 }
@@ -599,12 +766,14 @@ async function wireRunCompletion(held: Held) {
   if (held.done) return
   if (result.status === "cancelled") return abortHeld(held)
   if (result.status === "error") return failHeld(held, result.error ?? new Error("cursor run failed"))
-  const usage = mapUsage(result.usage) ?? held.usage
+  // the last turn's usage is the context opencode should see; result.usage sums every turn of the run
+  const usage = held.usage ?? mapUsage(result.usage, held.modelCalls)
   teardownHeld(held)
   rememberSession(held, [])
   openReply(held)
   held.sink?.finish("stop", usage)
   closeAgent(held)
+  setTimeout(() => checkCharges(held.agent.agentId, held.apiKey), CHARGE_CHECK_DELAY_MS).unref?.()
 }
 
 export function _resetForTest() {
@@ -645,32 +814,36 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   const lastMsg = body.messages[body.messages.length - 1]
   if (lastMsg?.role === "tool" && lastMsg.tool_call_id) {
     const agentId = agentByToolCallId.get(lastMsg.tool_call_id)
-    held = agentId ? heldByAgent.get(agentId) : undefined
-    if (!held || held.done) {
-      return Response.json(
-        { error: { message: "cursor run for this tool call expired — please retry", type: "invalid_request_error", code: "tool_call_expired" } },
-        { status: 400 },
-      )
-    }
-    if (held.idleTimer) clearTimeout(held.idleTimer)
-    held.messages = body.messages
-    held.textAcc = ""
-    held.reply = reply
-    held.response = sse?.response ?? null
-    held.opened = false
-    attachSignal(held, signal)
-    if (held.done) return reply.promise
-    attachSink(held, sink)
-    for (const m of body.messages) {
-      if (m.role !== "tool" || !m.tool_call_id) continue
-      const resolve = held.parked.get(m.tool_call_id)
-      if (resolve) {
-        held.parked.delete(m.tool_call_id)
-        agentByToolCallId.delete(m.tool_call_id)
-        resolve(textOf(m.content))
+    const parked = agentId ? heldByAgent.get(agentId) : undefined
+    if (parked && !parked.done) {
+      await acquireSlot(signal, true)
+      if (parked.done) releaseSlot()
+      else {
+        held = parked
+        held.slot = true
+        if (held.idleTimer) clearTimeout(held.idleTimer)
+        held.messages = body.messages
+        held.textAcc = ""
+        held.reply = reply
+        held.response = sse?.response ?? null
+        held.opened = false
+        attachSignal(held, signal)
+        if (held.done) return reply.promise
+        attachSink(held, sink)
+        for (const m of body.messages) {
+          if (m.role !== "tool" || !m.tool_call_id) continue
+          const resolve = held.parked.get(m.tool_call_id)
+          if (resolve) {
+            held.parked.delete(m.tool_call_id)
+            agentByToolCallId.delete(m.tool_call_id)
+            resolve(textOf(m.content))
+          }
+        }
+        return reply.promise
       }
     }
-    return reply.promise
+    // the run is gone (backstop, Esc, laptop sleep): a new turn below resumes its agent from the
+    // tool-call state it parked in and sends these results as the next message
   }
 
   // opencode wraps variant options as providerOptions.cursor; @ai-sdk/openai-compatible (name "cursor") spreads them into the body top level
@@ -678,29 +851,39 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
   if (typeof model === "string") return errorResponse(model, 400)
 
   // new turn: reuse the agent whose last-seen conversation matches our prefix
-  const prefix = body.messages.slice(0, -1)
-  const key = hashMessages(prefix, scope)
   await acquireSlot(signal)
-  const entry = sessions.get(key) ?? diskSessions.get(key)
+  const found = findSession(body.messages, scope)
   let agent: SDKAgent | undefined
   let cwd: string | undefined
   let newSuffix: OaMessage[] = body.messages
+  let restore: Held["restore"]
   const agentOptions = (cwd: string) => ({
     model,
     tools: ["mcp"] as ["mcp"],
     ...(apiKey ? { apiKey } : {}),
     local: { cwd, settingSources: ["project"] as ["project"], enableAgentRetries: true },
   })
-  if (entry) {
+  if (found) {
+    const { key, entry } = found
     sessions.delete(key)
     diskSessions.delete(key)
     cwd = entry.cwd
-    agent = await withRetry(() => Agent.resume(entry.agentId, agentOptions(cwd!)), signal).catch(() => {
+    agent = await withRetry(() => Agent.resume(entry.agentId, agentOptions(cwd!)), signal).catch(() => undefined)
+    if (signal?.aborted) {
+      // nothing reached the agent, so its entry still describes it
+      try { agent?.close() } catch {}
+      remember(key, entry)
+      releaseSlot()
+      throw abortError()
+    }
+    if (agent) {
+      newSuffix = found.suffix
+      restore = { key, entry }
+      if (!chargedCents.has(entry.agentId)) checkCharges(entry.agentId, apiKey, true)
+    } else {
       saveSessions()
-      releaseCwd(entry.cwd)
-      return undefined
-    })
-    if (agent) newSuffix = body.messages.slice(-1)
+      releaseCwd(entry.cwd, entry.agentId)
+    }
   }
   if (!agent) {
     cwd = await mkdtemp(TMP_CWD_PREFIX)
@@ -712,11 +895,13 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
       if (signal?.aborted || isAbort(err)) throw abortError()
       return errorResponse(err)
     }
+    chargedCents.set(agent.agentId, 0)
   }
 
   held = {
     agent,
     cwd: cwd!,
+    apiKey,
     model: body.model,
     run: null,
     messages: body.messages,
@@ -732,9 +917,12 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     parked: new Map(),
     flushTimer: null,
     idleTimer: null,
+    modelCalls: 0,
     wired: false,
     done: false,
     slot: true,
+    sent: false,
+    restore,
   }
   const self = held
   heldByAgent.set(agent.agentId, held)
@@ -757,9 +945,12 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     }
   }
 
-  await syncAgentsMd(cwd!, body.messages).catch((err) => {
-    if (!self.done) throw err
-  })
+  try {
+    await syncAgentsMd(cwd!, body.messages)
+  } catch (err) {
+    if (!self.done) failHeld(self, err)
+    return reply.promise
+  }
   if (self.done) return reply.promise
   const prompt =
     newSuffix
@@ -768,29 +959,36 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
       .filter(Boolean)
       .join("\n\n") || "(empty message)"
 
+  const sendOptions = {
+    onDelta: ({ update }: { update: { type: string; text?: string; usage?: Parameters<typeof mapUsage>[0] } }) => {
+      if (self.done) return
+      if (update.type === "text-delta" && update.text) {
+        openReply(self)
+        self.textAcc += update.text
+        emit(self, "text", update.text)
+        if (failAfterFirstDelta !== null) {
+          const message = failAfterFirstDelta
+          failAfterFirstDelta = null
+          failHeld(self, new Error(message))
+        }
+      } else if (update.type === "thinking-delta" && update.text) {
+        openReply(self)
+        emit(self, "reasoning", update.text)
+      } else if (update.type === "tool-requests-listed") {
+        // one per model response, tool calls or not
+        self.modelCalls++
+      } else if (update.type === "turn-ended") {
+        self.usage = mapUsage(update.usage, self.modelCalls)
+      }
+    },
+    local: { customTools: customTools as never },
+  }
   let run: Run
   try {
-    run = await withRetry(() => agent.send(prompt, {
-      onDelta: ({ update }: { update: { type: string; text?: string; usage?: { inputTokens?: number; outputTokens?: number } } }) => {
-        if (self.done) return
-        if (update.type === "text-delta" && update.text) {
-          openReply(self)
-          self.textAcc += update.text
-          emit(self, "text", update.text)
-          if (failAfterFirstDelta !== null) {
-            const message = failAfterFirstDelta
-            failAfterFirstDelta = null
-            failHeld(self, new Error(message))
-          }
-        } else if (update.type === "thinking-delta" && update.text) {
-          openReply(self)
-          emit(self, "reasoning", update.text)
-        } else if (update.type === "turn-ended") {
-          self.usage = mapUsage(update.usage)
-        }
-      },
-      local: { customTools: customTools as never },
-    }), signal, 1000, (err) => !self.opened && !self.done && isTransient(err))
+    run = await withRetry(() => {
+      self.sent = true
+      return agent.send(prompt, sendOptions)
+    }, signal, 1000, (err) => !self.opened && !self.done && isTransient(err))
   } catch (err) {
     if (!self.done) failHeld(self, err)
     return reply.promise

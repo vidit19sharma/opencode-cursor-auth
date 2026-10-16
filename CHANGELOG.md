@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- Session resume after a tool-using turn never worked for `cursor/claude-*` models. opencode tags the last two messages with `cache_control` for ids containing `claude`, and the openai-compatible converter copies it into `tool_calls`, so a message hashed one turn earlier no longer matched; every such turn started a new agent and replayed the whole history. Tool calls now hash by id, name and arguments. With an opencode session id, system messages are left out of the key too (opencode's system prompt carries today's date; the prompt still reaches the agent via `AGENTS.md` each turn). Existing session keys change once.
+- Esc during a tool call left the Cursor run parked, holding a concurrency slot, for 10 minutes; a few interrupts stalled every Cursor request. The plugin now listens for opencode's `session.idle` / `session.status` events and releases that session's parked runs.
+- A tool that ran longer than 10 minutes (sub-agent, permission prompt, `question`, long bash) failed the turn with 400 `tool_call_expired`. The timeout is now a 2 h backstop, and tool results whose run is gone (backstop, Esc, laptop sleep) resume the run's agent from its tool calls instead of failing. A run parked on tool results no longer holds a slot; its continuation re-queues at the front, so Cursor sub-agents can't deadlock behind a Cursor parent.
+- opencode aborted requests after 5 minutes without response headers or between chunks, which a queued request, silent reasoning, or a large tool argument could exceed. The plugin defaults `headerTimeout` and `chunkTimeout` to 30 minutes for the cursor provider (user-set `provider.cursor.options` win).
+- An unwritable or full cache dir made `sessions.json` writes throw: plain turns never finished their stream, and tool flushes threw from a timer. Session persistence is now best effort and atomic (temp file, fsync, rename); temp-workspace removal no longer throws either.
+- A transient failure or a cancel before Cursor answered dropped the conversation's agent mapping, so the retry replayed the whole history into a new agent. The mapping is now kept: put back for a retry, or re-keyed to the history opencode will send after an Esc.
+- A parallel tool call that arrived after the 300 ms batch window was parked but never delivered, hanging the continuation. It now goes out on the next segment.
+- A failed `AGENTS.md` write leaked the concurrency slot and the held run; it now fails the request normally.
+- Reported usage now reads as context size, which is how opencode uses it (context meter, auto-compaction). Prompt tokens include Cursor's cache reads/writes (Cursor's `inputTokens` exclude them, so the meter undercounted or clamped to 0). Cursor sums a turn's usage over every model call of its agent loop, so long tool loops reported a multiple of the real context; the bridge now divides by the number of model calls. The final step prefers the last turn's usage over the run's total, and tool-call steps carry usage when Cursor reported it.
+- opencode's startup waited for the catalog fetch whenever the cache was stale, with no timeout, and every offline start fetched again. A stale catalog is now served immediately and refreshed in the background; a first run waits at most 15 s.
+- Cursor agents were never deleted: every conversation, title and summary request left an agent plus its store and transcript under `~/.cursor/projects/<workspace>` for good (`Agent.delete` alone keeps the transcript and store files). When a workspace is released (its session entry passed the 7-day TTL, or its first turn failed for good), the bridge now deletes the agent, waiting for a cancel to settle since the SDK refuses while a run is live, and removes Cursor's project dir along with the workspace.
+
+### Added
+
+- Charges beyond the plan are surfaced: after each turn the bridge reads what Cursor billed the agent (`Agent.getUsage`, `chargedCents`) and shows a toast when it grew, e.g. "Cursor billed $0.15 on-demand for the last turn ($0.52 in this conversation)". opencode still shows $0 per message, since it prices a step as tokens × `model.cost` and only Copilot can report a real cost. Accounts where Cursor answers `feature_unavailable` (SDK billing not enabled) are asked once per process, then never again.
+
+### Changed
+
+- Errors are classified by the SDK's backend error code before its class or message: `BAD_API_KEY` / `BAD_USER_API_KEY` → 401, `MODEL_BLOCKED` → 403, and a spent plan (`FREE_USER_USAGE_LIMIT` / `PRO_USER_USAGE_LIMIT`) → new 402 `insufficient_quota`, which neither the bridge nor opencode retries. A 429 carries `retry-after` when Cursor's message names a wait, and the SDK's `isRetryable: true` now counts as transient. Local system errors (e.g. `EACCES` writing `AGENTS.md`) are 502 and never mark a model blocked.
+
 ## 0.3.3 — 2026-10-16
 
 ### Added

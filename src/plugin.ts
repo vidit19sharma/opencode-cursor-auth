@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { Cursor, type SdkAuthStatus } from "@cursor/sdk"
-import { errorResponse, handleChatCompletion } from "./bridge.js"
+import { errorResponse, handleChatCompletion, releaseSession, setNotice } from "./bridge.js"
 import { currentModels } from "./models.js"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -8,6 +8,13 @@ import { join } from "node:path"
 export { parseContext } from "./models.js"
 
 const BASE_URL = "http://cursor.local/v1"
+// opencode's auth entry for a key the SDK keeps itself (~/.cursor/sdk/auth.json or CURSOR_API_KEY)
+const SDK_STORE_KEY = "cursor-sdk-store"
+
+// opencode aborts a request after 5 min without response headers, or between chunks. A Cursor turn can
+// sit longer: queued for a slot, reasoning silently, or writing a large tool argument (sent only once
+// complete). Set provider.cursor.options to override.
+const STREAM_TIMEOUT_MS = 30 * 60 * 1000
 
 // Cursor publishes no output limit and the bridge never passes max_tokens to Cursor, so output is only an accounting reserve for opencode.
 const DEFAULT_CONTEXT = 200_000
@@ -86,18 +93,21 @@ async function seedAuthEntry(client: PluginInput["client"] | undefined): Promise
   const file = join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "auth.json")
   const entries = await readFile(file, "utf8").then(JSON.parse, (err: NodeJS.ErrnoException) => (err.code === "ENOENT" ? {} : undefined))
   if (!entries || typeof entries !== "object" || "cursor" in entries) return
-  await client.auth.set({ path: { id: "cursor" }, body: { type: "api", key: "cursor-sdk-store" } })
+  await client.auth.set({ path: { id: "cursor" }, body: { type: "api", key: SDK_STORE_KEY } })
 }
 
 export const CursorAuthPlugin: Plugin = async (input) => {
   seedAuthEntry(input?.client).catch(() => {})
+  setNotice((message) => {
+    Promise.resolve(input?.client?.tui?.showToast?.({ body: { title: "Cursor", message, variant: "warning", duration: 10_000 } })).catch(() => {})
+  })
   return {
     config: async (config) => {
       const providers = (config.provider ??= {})
       const cursor = (providers["cursor"] ??= { models: {} })
       cursor.npm ??= "@ai-sdk/openai-compatible"
       cursor.name ??= "Cursor"
-      cursor.options = { ...cursor.options, baseURL: BASE_URL }
+      cursor.options = { headerTimeout: STREAM_TIMEOUT_MS, chunkTimeout: STREAM_TIMEOUT_MS, ...cursor.options, baseURL: BASE_URL }
       cursor.models ??= {}
       for (const [id, { name, context, variants }] of Object.entries(await currentModels())) {
         cursor.models[id] ??= { name }
@@ -112,11 +122,18 @@ export const CursorAuthPlugin: Plugin = async (input) => {
       if (input.model.providerID === "cursor") output.headers["x-opencode-session"] = input.sessionID
     },
 
+    // a session goes idle only once its loop is over, so a run still parked on its tool
+    // results (Esc mid-tool, an aborted sub-agent) will never get them
+    event: async ({ event }) => {
+      if (event.type === "session.idle") releaseSession(event.properties.sessionID)
+      else if (event.type === "session.status" && event.properties.status.type === "idle") releaseSession(event.properties.sessionID)
+    },
+
     auth: {
       provider: "cursor",
       loader: async (getAuth) => {
         const auth = await getAuth().catch(() => undefined)
-        pastedApiKey = auth?.type === "api" && auth.key !== "cursor-sdk-store" ? (auth.key ?? "").trim() : undefined
+        pastedApiKey = auth?.type === "api" && auth.key !== SDK_STORE_KEY ? (auth.key ?? "").trim() : undefined
         return {
           apiKey: "cursor-managed",
           baseURL: BASE_URL,
@@ -145,7 +162,7 @@ export const CursorAuthPlugin: Plugin = async (input) => {
               callback: async () => {
                 const result = await login
                 if (result instanceof Error) return { type: "failed" as const }
-                return { type: "success" as const, key: "cursor-sdk-store" }
+                return { type: "success" as const, key: SDK_STORE_KEY }
               },
             }
           },

@@ -6,6 +6,8 @@ import { join } from "node:path"
 const CACHE_DIR = join(homedir(), ".cache", "opencode-cursor-auth")
 const MODELS_CACHE_PATH = join(CACHE_DIR, "models.json")
 const MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const MODELS_FETCH_TIMEOUT_MS = 15_000
+const MODELS_RETRY_MS = 5 * 60 * 1000
 
 type Variant = { params: ModelParameterValue[]; context?: number }
 export type ModelInfo = {
@@ -79,27 +81,48 @@ function loadCachedModels(): ModelsCache | undefined {
   return undefined
 }
 
-// Live model list from Cursor, cached 24h to keep opencode startup fast.
-// Offline/logged-out: stale cache if present, else just "auto" (Cursor's universal alias).
+let refreshing: Promise<void> | undefined
+let lastAttempt = 0
+
+function refreshCatalog() {
+  lastAttempt = Date.now()
+  refreshing ??= (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error("timed out")), MODELS_FETCH_TIMEOUT_MS)))
+    try {
+      const fresh = buildCatalog(await Promise.race([Cursor.models.list(), timeout]))
+      for (const [id, m] of Object.entries(catalog)) if (m.blocked && fresh[id]) fresh[id].blocked = true
+      catalog = fresh
+      fetchedAt = Date.now()
+      try {
+        saveCatalog()
+      } catch {
+        // cache dir unwritable — the fresh list still serves this process
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  })()
+    .catch(() => {})
+    .finally(() => (refreshing = undefined))
+}
+
+// Live model list from Cursor, cached 24h. A stale cache is served as is and refreshed in the
+// background (new models show up on the next start), so opencode's startup never waits on Cursor;
+// only a first run with no cache does, for at most MODELS_FETCH_TIMEOUT_MS.
+// Offline/logged-out with no cache: just "auto" (Cursor's universal alias).
 // Models Cursor has rejected with "Model Blocked" for this account are hidden
 // until the cache file is deleted (the catalog itself carries no entitlement info).
 export async function currentModels(): Promise<Record<string, ModelInfo>> {
   const cached = loadCachedModels()
-  if (cached && Date.now() - cached.fetchedAt <= MODELS_CACHE_TTL_MS) {
+  if (cached && cached.fetchedAt >= fetchedAt) {
     catalog = cached.models
     fetchedAt = cached.fetchedAt
-  } else {
-    try {
-      catalog = buildCatalog(await Cursor.models.list())
-      for (const [id, m] of Object.entries(cached?.models ?? {})) if (m.blocked && catalog[id]) catalog[id].blocked = true
-      fetchedAt = Date.now()
-      saveCatalog()
-    } catch {
-      catalog = cached?.models ?? { auto: { name: "Auto" } }
-      fetchedAt = cached?.fetchedAt ?? 0
-    }
   }
-  return Object.fromEntries(Object.entries(catalog).filter(([, m]) => !m.blocked))
+  if (Date.now() - fetchedAt > MODELS_CACHE_TTL_MS && Date.now() - lastAttempt > MODELS_RETRY_MS) refreshCatalog()
+  if (!Object.keys(catalog).length) await refreshing
+  const models: Record<string, ModelInfo> = Object.keys(catalog).length ? catalog : { auto: { name: "Auto" } }
+  return Object.fromEntries(Object.entries(models).filter(([, m]) => !m.blocked))
 }
 
 function loadCatalog() {

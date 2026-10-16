@@ -20,8 +20,14 @@ mock.module("@cursor/sdk", () => ({
   Agent: {},
 }))
 const bridgeMock = mock(async (..._a: unknown[]) => new Response("ok"))
+const releaseMock = mock((_scope: string) => {})
+let notice: ((message: string) => void) | undefined
 mock.module("../src/bridge.ts", () => ({
   handleChatCompletion: bridgeMock,
+  releaseSession: releaseMock,
+  setNotice: (fn: (message: string) => void) => {
+    notice = fn
+  },
   // same shape as the real errorResponse for the inputs plugin.ts passes
   errorResponse: (err: { message?: string; code?: string } | string, status: number) => {
     const e = typeof err === "string" ? { message: err } : err
@@ -168,6 +174,37 @@ test("chat.headers stamps session only for cursor provider", async () => {
   }
   expect(await run("cursor")).toEqual({ "x-opencode-session": "ses_x" })
   expect(await run("anthropic")).toEqual({})
+})
+
+test("config: 30 min header/chunk timeouts unless the user set them", async () => {
+  const cfg = {} as { provider?: Record<string, { options?: Record<string, unknown> }> }
+  await hooks.config!(cfg as never)
+  expect(cfg.provider!.cursor.options).toMatchObject({ headerTimeout: 1_800_000, chunkTimeout: 1_800_000, baseURL: "http://cursor.local/v1" })
+  const own = { provider: { cursor: { options: { chunkTimeout: 5 } } } }
+  await hooks.config!(own as never)
+  expect(own.provider.cursor.options).toMatchObject({ chunkTimeout: 5, headerTimeout: 1_800_000 })
+})
+
+test("idle session events release that session's parked runs", async () => {
+  releaseMock.mockClear()
+  const event = (type: string, properties: Record<string, unknown>) => hooks.event!({ event: { type, properties } } as never)
+  await event("session.status", { sessionID: "ses_busy", status: { type: "busy" } })
+  expect(releaseMock).not.toHaveBeenCalled()
+  await event("session.idle", { sessionID: "ses_a" })
+  await event("session.status", { sessionID: "ses_b", status: { type: "idle" } })
+  expect(releaseMock.mock.calls.map((c) => c[0])).toEqual(["ses_a", "ses_b"])
+})
+
+test("bridge notices become a warning toast; without a TUI they are dropped", async () => {
+  const showToast = mock(async (_a: unknown) => ({}))
+  await makePlugin({ ...makeClient(), tui: { showToast } } as never)
+  notice!("Cursor billed $0.15 on-demand for the last turn ($0.52 in this conversation)")
+  await Bun.sleep(5)
+  expect(showToast.mock.calls[0][0]).toEqual({
+    body: { title: "Cursor", message: "Cursor billed $0.15 on-demand for the last turn ($0.52 in this conversation)", variant: "warning", duration: 10_000 },
+  })
+  await makePlugin()
+  expect(() => notice!("no tui")).not.toThrow()
 })
 
 test("seedAuthEntry seeds sentinel only when no cursor entry exists", async () => {
