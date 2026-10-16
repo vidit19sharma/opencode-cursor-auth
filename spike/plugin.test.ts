@@ -21,9 +21,11 @@ mock.module("@cursor/sdk", () => ({
 }))
 const bridgeMock = mock(async (..._a: unknown[]) => new Response("ok"))
 const releaseMock = mock((_scope: string) => {})
+const forgetMock = mock((_scope: string) => {})
 mock.module("../src/bridge.ts", () => ({
   handleChatCompletion: bridgeMock,
   releaseParked: releaseMock,
+  forgetSession: forgetMock,
   // same shape as the real errorResponse for the inputs plugin.ts passes
   errorResponse: (err: { message?: string; code?: string } | string, status: number) => {
     const e = typeof err === "string" ? { message: err } : err
@@ -51,7 +53,7 @@ async function callChat(key?: string) {
   const res: Response = await fetch("http://cursor.local/v1/chat/completions", {
     method: "POST",
     body: JSON.stringify({ model: "gpt-5.5", messages: [{ role: "user", content: "hi" }] }),
-    headers: { "x-opencode-session": "ses_unit" },
+    headers: { "x-opencode-session": "ses_unit", "x-opencode-agent": "build" },
   })
   return { res, called: bridgeMock.mock.calls.length > 0, args: bridgeMock.mock.calls[0] }
 }
@@ -86,6 +88,7 @@ test("valid pasted key is trimmed, passed to bridge, status skipped", async () =
   expect(res.status).toBe(200)
   expect(args?.[1]).toBe("crsr_abc")
   expect(args?.[3]).toBe("ses_unit")
+  expect(args?.[4]).toBe("build")
   expect(statusMock).not.toHaveBeenCalled()
 })
 
@@ -162,13 +165,13 @@ test("login rejection → callback failed", async () => {
   expect(await result.callback()).toEqual({ type: "failed" })
 })
 
-test("chat.headers stamps session only for cursor provider", async () => {
+test("chat.headers stamps session + agent only for cursor provider", async () => {
   const run = async (providerID: string) => {
     const output = { headers: {} as Record<string, string> }
-    await hooks["chat.headers"]!({ sessionID: "ses_x", model: { providerID } } as never, output)
+    await hooks["chat.headers"]!({ sessionID: "ses_x", agent: "title", model: { providerID } } as never, output)
     return output.headers
   }
-  expect(await run("cursor")).toEqual({ "x-opencode-session": "ses_x" })
+  expect(await run("cursor")).toEqual({ "x-opencode-session": "ses_x", "x-opencode-agent": "title" })
   expect(await run("anthropic")).toEqual({})
 })
 
@@ -181,12 +184,11 @@ test("config: 30 min header/chunk timeouts unless the user set them", async () =
   expect(own.provider.cursor.options).toMatchObject({ chunkTimeout: 5, headerTimeout: 1_800_000 })
 })
 
-test("seedAuthEntry seeds sentinel only when no cursor entry exists", async () => {
+test("seedAuthEntry seeds sentinel before init resolves, only when no cursor entry exists", async () => {
   const dir = join(process.env.XDG_DATA_HOME!, "opencode")
   rmSync(dir, { recursive: true, force: true })
   const fresh = makeClient()
   await makePlugin(fresh)
-  await Bun.sleep(20)
   expect(fresh.auth.set).toHaveBeenCalledTimes(1)
   expect(fresh.auth.set.mock.calls[0][0]).toEqual({ path: { id: "cursor" }, body: { type: "api", key: "cursor-sdk-store" } })
 
@@ -194,8 +196,14 @@ test("seedAuthEntry seeds sentinel only when no cursor entry exists", async () =
   writeFileSync(join(dir, "auth.json"), JSON.stringify({ cursor: { type: "api", key: "x" } }))
   const seeded = makeClient()
   await makePlugin(seeded)
-  await Bun.sleep(20)
   expect(seeded.auth.set).not.toHaveBeenCalled()
+})
+
+test("event: session.deleted forgets that session", async () => {
+  forgetMock.mockClear()
+  await hooks.event!({ event: { type: "session.deleted", properties: { sessionID: "ses_gone", info: { id: "ses_gone" } } } } as never)
+  await hooks.event!({ event: { type: "session.updated", properties: { info: { id: "ses_other" } } } } as never)
+  expect(forgetMock.mock.calls).toEqual([["ses_gone"]])
 })
 
 test("event: session idle releases that session's parked runs, other events do not", async () => {

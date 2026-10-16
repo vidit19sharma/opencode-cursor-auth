@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { Cursor, type SdkAuthStatus } from "@cursor/sdk"
-import { errorResponse, handleChatCompletion, releaseParked } from "./bridge.js"
+import { errorResponse, forgetSession, handleChatCompletion, releaseParked } from "./bridge.js"
 import { currentModels } from "./models.js"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -71,11 +71,9 @@ async function cursorFetch(input: Request | string | URL, init?: RequestInit): P
     if (problem) return errorResponse(problem, 401)
     const body = JSON.parse(await bodyText(input, init))
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
-    const scope =
-      new Headers(init?.headers).get("x-opencode-session") ??
-      (input instanceof Request ? input.headers.get("x-opencode-session") : null) ??
-      undefined
-    return handleChatCompletion(body, pastedApiKey, signal, scope)
+    const header = (name: string) =>
+      new Headers(init?.headers).get(name) ?? (input instanceof Request ? input.headers.get(name) : null) ?? undefined
+    return handleChatCompletion(body, pastedApiKey, signal, header("x-opencode-session"), header("x-opencode-agent"))
   }
   if (url.includes("/models")) {
     return Response.json({
@@ -95,7 +93,7 @@ async function seedAuthEntry(client: PluginInput["client"] | undefined): Promise
 }
 
 export const CursorAuthPlugin: Plugin = async (input) => {
-  seedAuthEntry(input?.client).catch(() => {})
+  await seedAuthEntry(input?.client).catch(() => {})
   return {
     config: async (config) => {
       const providers = (config.provider ??= {})
@@ -117,10 +115,13 @@ export const CursorAuthPlugin: Plugin = async (input) => {
     event: async ({ event }) => {
       if (event.type === "session.idle" || (event.type === "session.status" && event.properties.status.type === "idle"))
         releaseParked(event.properties.sessionID)
+      if (event.type === "session.deleted") forgetSession(event.properties.info.id)
     },
 
     "chat.headers": async (input, output) => {
-      if (input.model.providerID === "cursor") output.headers["x-opencode-session"] = input.sessionID
+      if (input.model.providerID !== "cursor") return
+      output.headers["x-opencode-session"] = input.sessionID
+      output.headers["x-opencode-agent"] = encodeURIComponent(String(input.agent))
     },
 
     auth: {
