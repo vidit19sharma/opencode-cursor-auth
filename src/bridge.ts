@@ -397,9 +397,11 @@ function releaseCwd(cwd: string) {
 }
 
 // scope (opencode session id) is folded in so identical histories from
-// different sessions (e.g. parallel sub-agents) never share a Cursor agent
+// different sessions (e.g. parallel sub-agents) never share a Cursor agent.
+// Tool calls hash by id/name/arguments only: opencode tags the last two messages with
+// cache_control for claude-* ids, so the same call serializes differently a turn later.
 function hashMessages(messages: OaMessage[], scope?: string): string {
-  const norm: unknown[] = messages.map((m) => [m.role, textOf(m.content), m.tool_call_id ?? "", JSON.stringify(m.tool_calls ?? null)])
+  const norm: unknown[] = messages.map((m) => [m.role, textOf(m.content), m.tool_call_id ?? "", (m.tool_calls ?? []).map((c) => [c.id, c.function?.name, c.function?.arguments])])
   if (scope) norm.unshift(["scope", scope])
   return createHash("sha256").update(JSON.stringify(norm)).digest("hex")
 }
