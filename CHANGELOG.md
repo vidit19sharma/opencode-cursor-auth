@@ -2,7 +2,20 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 0.3.5 — 2026-10-16
+## 0.3.6 — 2026-10-16
+
+### Added
+
+- Images. Attachments in a message are forwarded to Cursor (`data:` URLs inline, `http(s)` by reference). Every model is advertised as image-capable because Cursor's catalog carries no vision flag; a model that cannot take images answers with Cursor's own error.
+
+### Fixed
+
+- Cursor's built-in tools (shell, read, edit, …) are now explicitly disabled on every agent, not only via the `tools: ["mcp"]` header. The model can only act through opencode's tools.
+- A stored workspace is resumed only if it is still a real, private directory owned by the current user. A path swapped for a symlink or opened up to other users drops the session entry instead of being reused.
+- `sessions.json` and `models.json` are written `0600` (cache directory `0700`). Existing files are fixed on the next save.
+- When a conversation is replayed into a fresh agent, each turn is wrapped in nonce delimiters so text inside a tool result cannot pose as a user turn.
+
+## 0.3.5 — 2026-10-16 (not published to npm; included in 0.3.6)
 
 ### Fixed
 

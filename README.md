@@ -8,8 +8,9 @@ The plugin bridges opencode's OpenAI-style chat requests to the official [`@curs
 
 - **Official SDK, not a reverse-engineered API** — auth, checksums, and client versioning handled by `@cursor/sdk`
 - **In-process bridge** — no local HTTP proxy, no port to collide on, no extra daemon
-- **Full tool loop** — opencode's native tools (read, edit, bash, MCP, …) work end-to-end via a held-run bridge: one Cursor run spans the whole tool exchange
+- **Full tool loop** — opencode's native tools (read, edit, bash, MCP, …) work end-to-end via a held-run bridge: one Cursor run spans the whole tool exchange. Cursor's own built-in tools are disabled, so the model can only act through opencode
 - **Thinking blocks** — Cursor reasoning streams into opencode as proper thinking blocks (`reasoning_content`)
+- **Images** — attachments in a message are forwarded to Cursor (every model is advertised as image-capable; a model that cannot take images answers with Cursor's own error)
 - **Session resume** — conversations map to native Cursor agents (`Agent.resume`), in-memory and persisted to disk for 7 days, scoped per opencode session so parallel sub-agents never share an agent
 - **System prompts** — delivered via `AGENTS.md` in a per-session workspace (the `--system-prompt` flag is server-gated by Cursor)
 - **Dynamic model list with variants** — fetched live from `Cursor.models.list()`, cached 24h; one id per model, with every reasoning-effort / thinking / fast / context variant on opencode's Ctrl+T variant picker
@@ -180,7 +181,7 @@ bun run test:cli     # exercises the npx setup command against temp config dirs 
 bun run smoke        # packs the plugin and loads it in a pristine HOME (startup, auth login, first request before login)
 ```
 
-The e2e suite (Tests 0-26) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, token-usage estimation for tool loops, cross-process session resume, and the startup workspace sweep.
+The e2e suite (Tests 0-30) covers plain streaming, a full tool loop on one held run, in-memory and disk-persisted session resume, AGENTS.md system-prompt delivery, mid-stream abort, error statuses, session scoping, context limits and key checks, model variants, the concurrency cap, retry semantics, blocked models, parked-run slot and expiry handling, token-usage estimation for tool loops, cross-process session resume, the startup workspace sweep, image forwarding, workspace validation, built-in tool refusal, and replay injection.
 
 ## Known limitations
 
