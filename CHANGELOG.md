@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.0 — 2026-10-16
+
+### Changed
+
+- A run parked on a tool call used to be released after a fixed 10 minutes, which killed long tools (a 20-minute build) and forced a replay. The backstop now follows opencode: while the session is reported busy or retrying, the parked run is kept, up to a 2-hour hard cap in case opencode dies without an idle event. Esc still releases immediately.
+
+### Fixed
+
+- A failed browser login printed nothing; the reason now goes to stderr. A successful login resets the key-status cache, so the first request works without waiting out the 60-second cache.
+- `Agent.create` and `send` carry an idempotency key across retry attempts.
+
+### Added
+
+- GitHub Actions CI (build, unit and CLI tests, single-export check) and an in-repo `RELEASE.md`.
+
 ## 0.3.6 — 2026-10-16
 
 ### Added
