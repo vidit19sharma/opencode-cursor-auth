@@ -2,10 +2,14 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.3.4 — 2026-10-16
 
 ### Fixed
 
+- A run waiting for a tool result held a concurrency slot until its continuation or the 10-minute timer, so a Cursor parent parked on a Cursor sub-agent could deadlock at the cap and Esc pinned a slot for 10 minutes. Parked runs now release their slot; continuations re-acquire one through a priority queue. Esc (session idle) releases that session's parked runs immediately; a second continuation for the same tool call gets 409 `continuation_in_progress`.
+- A parallel tool call that arrived after the 300 ms batch window was never delivered and the run hung until the idle timer. It is now delivered on the next segment.
+- A tool result for a run that is gone (Esc, idle release, sleep, restart) returned 400 `tool_call_expired`. It now replays the conversation into a fresh agent, with tool results attributed by name and the earlier calls marked as already made.
+- After a tool loop, opencode's context meter and auto-compaction saw Cursor's summed usage for every model call in the run (2–4× the real context). The bridge now reports an upper-bound estimate of the last call's prompt, remembering the previous turn's prompt per agent, and keeps `cached_tokens` ≤ `prompt_tokens` (Cursor's `inputTokens` already includes cache).
 - Errors are classified by Cursor's backend error code before the SDK class or message: `BAD_API_KEY` / `BAD_USER_API_KEY` → 401, `MODEL_BLOCKED` → 403, and a spent plan (`FREE_USER_USAGE_LIMIT` / `PRO_USER_USAGE_LIMIT`) → new 402 `insufficient_quota`, which is never retried. A 429 carries `retry-after` when Cursor's message names a wait; aborts are never retried. Local system errors (e.g. `EACCES` writing `AGENTS.md`) are 502 and never mark a model blocked. (from #1 by @Dakuaisu)
 - An unwritable or full cache dir made `sessions.json` writes throw, failing turns and throwing from the tool-flush timer; session persistence is now best effort and atomic (temp file, fsync, rename), and workspace removal no longer throws. A failed `AGENTS.md` write now fails the request normally instead of leaking the concurrency slot. A stale model catalog is served immediately and refreshed in the background; a first run with no cache waits at most 15 s. (from #1 by @Dakuaisu)
 - opencode aborted requests after 5 minutes without response headers or between chunks, which a queued request, silent reasoning or a large tool argument could exceed. `headerTimeout` and `chunkTimeout` now default to 30 minutes for the cursor provider (user-set `provider.cursor.options` win). (from #1 by @Dakuaisu)
