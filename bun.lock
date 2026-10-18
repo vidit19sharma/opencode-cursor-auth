@@ -5,7 +5,7 @@
     "": {
       "name": "opencode-cursor-auth",
       "dependencies": {
-        "@cursor/sdk": "^1.0.36",
+        "@cursor/sdk": "1.0.37",
       },
       "devDependencies": {
         "@opencode-ai/plugin": "latest",

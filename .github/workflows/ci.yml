@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -23,6 +26,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun test spike/plugin.test.ts
+      - run: bun test spike/bridge.test.ts
       - run: bun run test:cli
       - name: entry exports only default
         run: bun -e 'import("./dist/index.js").then(m=>{const k=Object.keys(m);if(k.length!==1||k[0]!=="default"){console.error(k);process.exit(1)}})'

@@ -35,7 +35,8 @@
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js",
-    "test": "bun spike/e2e-bridge.ts",
+    "test": "bun test spike/plugin.test.ts && bun test spike/bridge.test.ts && bun run test:cli",
+    "test:e2e": "bun spike/e2e-bridge.ts",
     "spike": "bun spike/validate-sdk.ts",
     "smoke": "bash scripts/fresh-home-smoke.sh",
     "prepublishOnly": "npm run build",
@@ -43,7 +44,7 @@
     "test:plugin": "bun test spike/plugin.test.ts"
   },
   "dependencies": {
-    "@cursor/sdk": "^1.0.36"
+    "@cursor/sdk": "1.0.37"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
