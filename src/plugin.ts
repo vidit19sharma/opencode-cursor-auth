@@ -78,22 +78,28 @@ async function cursorFetch(input: Request | string | URL, init?: RequestInit): P
   if (url.includes("/models")) {
     return Response.json({
       object: "list",
-      data: Object.keys(await currentModels()).map((id) => ({ id, object: "model" })),
+      data: Object.keys(await currentModels(pastedApiKey)).map((id) => ({ id, object: "model" })),
     })
   }
   return Response.json({ error: { message: `unsupported endpoint: ${url}` } }, { status: 404 })
 }
 
-async function seedAuthEntry(client: PluginInput["client"] | undefined): Promise<void> {
-  if (!client?.auth?.set) return
+type AuthEntries = { cursor?: { type?: string; key?: string } }
+
+// returns opencode's auth.json entries so the startup catalog fetch can use a pasted key
+async function seedAuthEntry(client: PluginInput["client"] | undefined): Promise<AuthEntries | undefined> {
   const file = join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "auth.json")
-  const entries = await readFile(file, "utf8").then(JSON.parse, (err: NodeJS.ErrnoException) => (err.code === "ENOENT" ? {} : undefined))
-  if (!entries || typeof entries !== "object" || "cursor" in entries) return
-  await client.auth.set({ path: { id: "cursor" }, body: { type: "api", key: "cursor-sdk-store" } })
+  const entries: unknown = await readFile(file, "utf8").then(JSON.parse, (err: NodeJS.ErrnoException) => (err.code === "ENOENT" ? {} : undefined))
+  if (!entries || typeof entries !== "object") return undefined
+  if (client?.auth?.set && !("cursor" in entries)) await client.auth.set({ path: { id: "cursor" }, body: { type: "api", key: "cursor-sdk-store" } })
+  return entries as AuthEntries
 }
 
 export const CursorAuthPlugin: Plugin = async (input) => {
-  await seedAuthEntry(input?.client).catch(() => {})
+  const saved = (await seedAuthEntry(input?.client).catch(() => undefined))?.cursor
+  // config runs before the auth loader, so pastedApiKey is not known yet
+  const startupKey =
+    saved?.type === "api" && typeof saved.key === "string" && saved.key !== "cursor-sdk-store" ? saved.key.trim() : process.env.CURSOR_API_KEY
   return {
     config: async (config) => {
       const providers = (config.provider ??= {})
@@ -102,7 +108,7 @@ export const CursorAuthPlugin: Plugin = async (input) => {
       cursor.name ??= "Cursor"
       cursor.options = { headerTimeout: STREAM_TIMEOUT_MS, chunkTimeout: STREAM_TIMEOUT_MS, ...cursor.options, baseURL: BASE_URL }
       cursor.models ??= {}
-      for (const [id, { name, context, variants }] of Object.entries(await currentModels())) {
+      for (const [id, { name, context, variants }] of Object.entries(await currentModels(startupKey || undefined))) {
         cursor.models[id] ??= { name }
         const model = cursor.models[id] as (typeof cursor.models)[string] & { variants?: Record<string, Record<string, unknown>> }
         model.cost = { input: 0, output: 0, cache_read: 0, cache_write: 0 }

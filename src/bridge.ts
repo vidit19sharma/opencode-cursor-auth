@@ -13,7 +13,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, statSync, writeSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
-import { basename, dirname, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { markBlocked, resolveVariant } from "./models.js"
 
 // @cursor/sdk has no log-level switch: it prints "HH:MM:SS.mmm INFO ..." through
@@ -117,7 +117,7 @@ function statusFor(err: unknown): number {
   const code = typeof e.code === "string" ? e.code : ""
   if (err instanceof AuthenticationError || e.status === 401 || KEY_CODES.has(code) || /invalid user api key/i.test(msg)) return 401
   // 402, not 429: opencode retries a 429, and waiting does not refill a plan's included usage
-  if (USAGE_LIMIT_CODES.has(code)) return 402
+  if (USAGE_LIMIT_CODES.has(code) || /usage limit/i.test(msg)) return 402
   if (err instanceof RateLimitError || e.status === 429 || code === "resource_exhausted" || /rate limit/i.test(msg)) return 429
   if (code === "MODEL_BLOCKED" || code === "permission_denied" || /model blocked|permission denied|forbidden/i.test(msg)) return 403
   if (err instanceof ConfigurationError || code === "invalid_argument" || code === "not_found" || /cannot use this model|unknown model/i.test(msg)) return 400
@@ -393,7 +393,7 @@ type Held = {
   detachSignal: (() => void) | null
   buffer: { kind: "text" | "reasoning"; t: string }[]
   pendingCalls: ToolCallOut[]
-  parked: Map<string, (result: string) => void>
+  parked: Map<string, { resolve: (result: string) => void; reject: (err: Error) => void }>
   flushTimer: ReturnType<typeof setTimeout> | null
   idleTimer: ReturnType<typeof setTimeout> | null
   parkedAt?: number
@@ -418,7 +418,8 @@ const busyScopes = new Set<string>()
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 // ponytail: single-user plugin, fixed cap; make configurable if ever shared
 const MAX_SESSIONS = 256
-const SESSION_STORE_DIR = join(homedir(), ".cache", "opencode-cursor-auth")
+const xdgCache = process.env.XDG_CACHE_HOME
+const SESSION_STORE_DIR = join(xdgCache && isAbsolute(xdgCache) ? xdgCache : join(homedir(), ".cache"), "opencode-cursor-auth")
 const SESSION_STORE_PATH = join(SESSION_STORE_DIR, "sessions.json")
 const TMP_CWD_PREFIX = join(tmpdir(), "opencode-cursor-")
 
@@ -431,8 +432,9 @@ let loading: Promise<void> | undefined
 // Where @cursor/sdk keeps a workspace's agent store and transcripts. The slug mirrors the SDK's
 // utils/workspace-paths; transcripts honour CURSOR_DATA_DIR (used untrimmed, as the SDK does) while the
 // agent store always lives under ~/.cursor. Only ever called for our own tmp workspaces (releaseCwd guard).
+const slugOf = (cwd: string) => cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "")
 function cursorProjectDirs(cwd: string): string[] {
-  const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "")
+  const slug = slugOf(cwd)
   const dataDir = process.env.CURSOR_DATA_DIR
   const home = join(homedir(), ".cursor")
   return [...new Set([join(dataDir?.trim() ? dataDir : home, "projects", slug), join(home, "projects", slug)])]
@@ -448,7 +450,8 @@ function ownsWorkspace(cwd: string): boolean {
   try {
     const st = lstatSync(cwd)
     const uid = process.getuid?.()
-    return st.isDirectory() && !st.isSymbolicLink() && (uid === undefined || st.uid === uid) && (st.mode & 0o077) === 0
+    // Windows reports 0o666/0o777 and no meaningful uid
+    return st.isDirectory() && !st.isSymbolicLink() && (process.platform === "win32" || ((uid === undefined || st.uid === uid) && (st.mode & 0o077) === 0))
   } catch {
     return false
   }
@@ -456,7 +459,7 @@ function ownsWorkspace(cwd: string): boolean {
 
 // Once nothing references a workspace, nothing can resume its agent either: delete the agent (after
 // its cancel settles, the SDK refuses while a run is live), Cursor's store and transcript for it, and
-// the workspace.
+// the workspace (only if it is still a private directory of ours: on a shared /tmp anyone can plant the name).
 function releaseCwd(cwd: string, agentId?: string, settled?: Promise<unknown>) {
   if (!isOwnWorkspace(cwd)) return
   for (const v of sessions.values()) if (v.cwd === cwd) return
@@ -465,7 +468,7 @@ function releaseCwd(cwd: string, agentId?: string, settled?: Promise<unknown>) {
     .then(() => (agentId ? Agent.delete(agentId, { cwd }) : undefined))
     .catch(() => {})
     .finally(() => {
-      for (const dir of [...cursorProjectDirs(cwd), cwd]) try { rmSync(dir, { recursive: true, force: true }) } catch {}
+      for (const dir of [...cursorProjectDirs(cwd), ...(ownsWorkspace(cwd) ? [cwd] : [])]) try { rmSync(dir, { recursive: true, force: true }) } catch {}
     })
 }
 
@@ -479,17 +482,26 @@ function hashMessages(messages: OaMessage[]): string {
   return createHash("sha256").update(JSON.stringify(norm)).digest("hex")
 }
 
-const loadSessions = () => (loading ??= doLoadSessions())
+// never memoise a rejection: one bad load would fail every request until restart
+const loadSessions = () => (loading ??= doLoadSessions().catch(() => {}))
+
+const validEntry = (v: unknown): v is SessionEntry => {
+  const e = v as Partial<SessionEntry> | null
+  return !!e && typeof e.agentId === "string" && typeof e.cwd === "string" && typeof e.prefixHash === "string" &&
+    typeof e.lastUsedAt === "number" && (e.lastPrompt === undefined || typeof e.lastPrompt === "number")
+}
 
 async function doLoadSessions() {
   try {
-    const raw = JSON.parse(await readFile(SESSION_STORE_PATH, "utf8")) as { version?: number; entries?: Record<string, SessionEntry> }
+    const raw = JSON.parse(await readFile(SESSION_STORE_PATH, "utf8")) as { version?: number; entries?: Record<string, unknown> }
     // v1 (<= 0.3.4) keys hashed the system prompt, so none can match again; its workspaces are left to
     // sweepOrphans rather than released here, an older opencode process may still be using them
-    if (raw.version === 2) for (const [k, v] of Object.entries(raw.entries ?? {})) sessions.set(k, v)
+    if (raw.version === 2) for (const [k, v] of Object.entries(raw.entries ?? {})) if (validEntry(v)) sessions.set(k, v)
   } catch {}
-  sweepOrphans()
-  sweepSessions()
+  try {
+    sweepOrphans()
+    sweepSessions()
+  } catch {}
 }
 
 // Workspaces/project dirs no entry references, untouched for SESSION_TTL_MS. Age is the newest of the dir's and
@@ -515,7 +527,8 @@ function sweepOrphans() {
       for (const name of readdirSync(root)) {
         const id = name.match(/-opencode-cursor-([A-Za-z0-9]{6})$/)?.[1]
         const p = join(root, name)
-        if (id && !live.has(p) && !existsSync(TMP_CWD_PREFIX + id) && old(p)) rmSync(p, { recursive: true, force: true })
+        // exact slug of OUR workspace: a real project such as ~/src/opencode-cursor-plugin also ends in -opencode-cursor-xxxxxx
+        if (id && name === slugOf(TMP_CWD_PREFIX + id) && !live.has(p) && !existsSync(TMP_CWD_PREFIX + id) && old(p)) rmSync(p, { recursive: true, force: true })
       }
     } catch {}
   }
@@ -656,12 +669,18 @@ function scheduleFlush(held: Held) {
   held.flushTimer = setTimeout(() => flushToolCalls(held), batchSettleMs)
 }
 
+// next backstop check: the idle timeout, but never past the hard cap
+export const _backstopDelay = (parkedAt: number, now: number) => Math.max(0, Math.min(idleTimeoutMs, PARKED_HARD_MAX_MS - (now - parkedAt)))
+
 function armIdle(held: Held) {
   if (held.idleTimer) clearTimeout(held.idleTimer)
+  const parkedAt = held.parkedAt ?? Date.now()
   held.idleTimer = setTimeout(() => {
-    if (held.scope && busyScopes.has(held.scope) && Date.now() - (held.parkedAt ?? 0) < PARKED_HARD_MAX_MS) armIdle(held)
-    else abortHeld(held)
-  }, idleTimeoutMs)
+    const capped = Date.now() - parkedAt >= PARKED_HARD_MAX_MS
+    if (held.scope && busyScopes.has(held.scope) && !capped) return armIdle(held)
+    if (capped && held.scope) busyScopes.delete(held.scope)
+    abortHeld(held)
+  }, _backstopDelay(parkedAt, Date.now()))
   held.idleTimer.unref?.()
 }
 
@@ -693,7 +712,11 @@ function teardownHeld(held: Held) {
   held.detachSignal = null
   if (held.flushTimer) clearTimeout(held.flushTimer)
   if (held.idleTimer) clearTimeout(held.idleTimer)
-  for (const id of held.parked.keys()) agentByToolCallId.delete(id)
+  for (const [id, p] of held.parked) {
+    agentByToolCallId.delete(id)
+    p.reject(new Error("run released"))
+  }
+  held.parked.clear()
   heldByAgent.delete(held.agent.agentId)
 }
 
@@ -867,11 +890,11 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
     attachSink(held, sink)
     for (const m of body.messages) {
       if (m.role !== "tool" || !m.tool_call_id) continue
-      const resolve = held.parked.get(m.tool_call_id)
-      if (resolve) {
+      const p = held.parked.get(m.tool_call_id)
+      if (p) {
         held.parked.delete(m.tool_call_id)
         agentByToolCallId.delete(m.tool_call_id)
-        resolve(textOf(m.content))
+        p.resolve(textOf(m.content))
       }
     }
     return reply.promise
@@ -984,10 +1007,11 @@ export async function handleChatCompletion(body: OaBody, apiKey?: string, signal
       description: t.function.description ?? "",
       inputSchema: t.function.parameters ?? { type: "object", properties: {} },
       execute: (args: unknown, ctx: { toolCallId?: string }) => {
+        if (self.done) return Promise.reject(new Error("run released"))
         const id = (ctx.toolCallId ?? `call_${randomUUID()}`).replace(/\s+/g, "_")
         self.pendingCalls.push({ id, name: t.function.name, argumentsJson: JSON.stringify(args ?? {}) })
         if (self.sink) scheduleFlush(self)
-        return new Promise<string>((resolve) => self.parked.set(id, resolve))
+        return new Promise<string>((resolve, reject) => self.parked.set(id, { resolve, reject }))
       },
     }
   }

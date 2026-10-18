@@ -1,9 +1,10 @@
 import { Cursor, type ModelListItem, type ModelParameterValue, type ModelSelection } from "@cursor/sdk"
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 
-const CACHE_DIR = join(homedir(), ".cache", "opencode-cursor-auth")
+const xdgCache = process.env.XDG_CACHE_HOME
+const CACHE_DIR = join(xdgCache && isAbsolute(xdgCache) ? xdgCache : join(homedir(), ".cache"), "opencode-cursor-auth")
 const MODELS_CACHE_PATH = join(CACHE_DIR, "models.json")
 const MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const MODELS_FETCH_TIMEOUT_MS = 15_000
@@ -85,7 +86,7 @@ function loadCachedModels(): ModelsCache | undefined {
 let refreshing: Promise<void> | undefined
 let lastAttempt = 0
 
-function refreshCatalog() {
+function refreshCatalog(apiKey?: string) {
   lastAttempt = Date.now()
   refreshing ??= (async () => {
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -95,7 +96,7 @@ function refreshCatalog() {
       timer.unref?.()
     })
     try {
-      const fresh = buildCatalog(await Promise.race([Cursor.models.list(), timeout]))
+      const fresh = buildCatalog(await Promise.race([Cursor.models.list(apiKey ? { apiKey } : undefined), timeout]))
       for (const [id, m] of Object.entries(catalog)) if (m.blocked && fresh[id]) fresh[id].blocked = true
       catalog = fresh
       fetchedAt = Date.now()
@@ -118,13 +119,14 @@ function refreshCatalog() {
 // Offline/logged-out with no cache: just "auto" (Cursor's universal alias).
 // Models Cursor has rejected with "Model Blocked" for this account are hidden
 // until the cache file is deleted (the catalog itself carries no entitlement info).
-export async function currentModels(): Promise<Record<string, ModelInfo>> {
+// ponytail: models.json is not keyed per account/key; a cache fetched with one key serves another until it expires
+export async function currentModels(apiKey?: string): Promise<Record<string, ModelInfo>> {
   const cached = loadCachedModels()
   if (cached && cached.fetchedAt >= fetchedAt) {
     catalog = cached.models
     fetchedAt = cached.fetchedAt
   }
-  if (Date.now() - fetchedAt > MODELS_CACHE_TTL_MS && Date.now() - lastAttempt > MODELS_RETRY_MS) refreshCatalog()
+  if (Date.now() - fetchedAt > MODELS_CACHE_TTL_MS && Date.now() - lastAttempt > MODELS_RETRY_MS) refreshCatalog(apiKey)
   if (!Object.keys(catalog).length) await refreshing
   const models: Record<string, ModelInfo> = Object.keys(catalog).length ? catalog : { auto: { name: "Auto" } }
   return Object.fromEntries(Object.entries(models).filter(([, m]) => !m.blocked))

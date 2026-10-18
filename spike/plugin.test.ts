@@ -37,7 +37,8 @@ mock.module("../src/bridge.ts", () => ({
     )
   },
 }))
-mock.module("../src/models.ts", () => ({ currentModels: async () => ({ auto: { name: "Auto" } }), parseContext: () => undefined }))
+const currentModelsMock = mock(async (_key?: string) => ({ auto: { name: "Auto" } }))
+mock.module("../src/models.ts", () => ({ currentModels: currentModelsMock, parseContext: () => undefined }))
 
 const { CursorAuthPlugin, _resetKeyCache } = await import("../src/plugin.ts")
 
@@ -263,4 +264,22 @@ test("event: session busy/retry marks the session busy, idle does not", async ()
   await fire({ type: "session.idle", properties: { sessionID: "ses_b" } })
   expect(busyMock.mock.calls).toEqual([["ses_b"], ["ses_r"]])
   expect(releaseMock.mock.calls).toEqual([["ses_i"], ["ses_b"]])
+})
+
+test("config: catalog fetch uses the pasted key from auth.json, else CURSOR_API_KEY, never the sentinel", async () => {
+  const dir = join(process.env.XDG_DATA_HOME!, "opencode")
+  mkdirSync(dir, { recursive: true })
+  const keyFor = async (cursor: unknown, env?: string) => {
+    writeFileSync(join(dir, "auth.json"), JSON.stringify({ cursor }))
+    if (env) process.env.CURSOR_API_KEY = env
+    const h = await makePlugin()
+    currentModelsMock.mockClear()
+    await h.config!({} as never)
+    delete process.env.CURSOR_API_KEY
+    return currentModelsMock.mock.calls[0][0]
+  }
+  expect(await keyFor({ type: "api", key: " crsr_paste \n" })).toBe("crsr_paste")
+  expect(await keyFor({ type: "api", key: "cursor-sdk-store" })).toBeUndefined()
+  expect(await keyFor({ type: "api", key: "cursor-sdk-store" }, "env_key")).toBe("env_key")
+  expect(await keyFor({ type: "oauth" })).toBeUndefined()
 })
