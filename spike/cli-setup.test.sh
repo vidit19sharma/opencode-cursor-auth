@@ -118,6 +118,26 @@ mkcache "$C" npm 0.2.0
 run update
 check "exit 0 + removed legacy" '[ $CODE -eq 0 ] && grep -q "removed cached 0.2.0" <<<"$OUT" && [ ! -e "$C/npm/@vidit19sharma/opencode-cursor-auth@latest" ]'
 
+perm() { node -e 'console.log((require("fs").statSync(process.argv[1]).mode & 0o777).toString(8))' "$1"; }
+
+echo "== 11. 0600 config keeps its perms, backup too"
+export OPENCODE_CONFIG_DIR="$ROOT/c11"; mkdir -p "$OPENCODE_CONFIG_DIR"; F="$OPENCODE_CONFIG_DIR/opencode.json"
+printf '{"provider":{"x":{"options":{"apiKey":"secret"}}}}' >"$F"; chmod 600 "$F"
+run setup
+check "exit 0" '[ $CODE -eq 0 ] && grep -q "opencode-cursor-auth@latest" "$F"'
+check "config still 600" '[ "$(perm "$F")" = 600 ]'
+check "backup 600" '[ "$(perm "$F.bak-cursor-auth")" = 600 ]'
+
+echo "== 12. symlinked config edited at its target, link kept"
+export OPENCODE_CONFIG_DIR="$ROOT/c12"; mkdir -p "$OPENCODE_CONFIG_DIR" "$ROOT/dotfiles"; F="$OPENCODE_CONFIG_DIR/opencode.json"
+printf '{"plugin":[]}' >"$ROOT/dotfiles/opencode.json"; ln -s "$ROOT/dotfiles/opencode.json" "$F"
+run setup
+check "exit 0" '[ $CODE -eq 0 ]'
+check "still a symlink" '[ -L "$F" ]'
+check "target edited" 'grep -q "opencode-cursor-auth@latest" "$ROOT/dotfiles/opencode.json"'
+check "no .tmp left" '[ ! -e "$ROOT/dotfiles/opencode.json.tmp" ] && [ ! -e "$F.tmp" ]'
+check "next steps: login before restart" '[ "$(grep -n "auth login" <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n "Restart opencode" <<<"$OUT" | cut -d: -f1)" ]'
+
 echo "== misc"
 run --help; check "--help exit 0" '[ $CODE -eq 0 ] && grep -q "Usage" <<<"$OUT"'
 run --bogus; check "unknown arg exit 1" '[ $CODE -eq 1 ]'

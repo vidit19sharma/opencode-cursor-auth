@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 import process from "node:process"
 
 const PKG = "@vidit19sharma/opencode-cursor-auth"
@@ -26,9 +26,10 @@ $OPENCODE_CONFIG_DIR, $XDG_CONFIG_HOME/opencode or ~/.config/opencode.
 
 Exit codes: 0 ok or already installed, 2 cannot edit safely (manual edit printed), 1 error.`
 
+// the model catalog and a pasted key load at opencode startup, so log in before restarting
 const NEXT = `Next steps:
-  1. Restart opencode
-  2. opencode auth login -> Cursor -> Log in with Cursor (browser)
+  1. opencode auth login -> Cursor -> Log in with Cursor (browser)
+  2. Restart opencode
   3. opencode models | grep cursor/`
 
 const MANUAL = `Add this to the top-level "plugin" array of your opencode config (create it if missing):
@@ -50,7 +51,8 @@ function tryParse(s: string): unknown {
 
 // opencode caches npm plugins in <cache>/packages/<name>@<spec>/ (older: <cache>/npm/) and never re-resolves @latest.
 function update(dryRun: boolean): number {
-  const cache = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "opencode")
+  const xdg = process.env.XDG_CACHE_HOME
+  const cache = join(xdg && isAbsolute(xdg) ? xdg : join(homedir(), ".cache"), "opencode")
   const [scope, name] = PKG.split("/")
   const dirs = ["packages", "npm"].flatMap((p) => {
     const parent = join(cache, p, scope)
@@ -148,9 +150,13 @@ function main(argv: string[]): number {
     return 0
   }
   mkdirSync(dirname(file), { recursive: true })
-  if (exists) writeFileSync(`${file}.bak-cursor-auth`, original)
-  writeFileSync(`${file}.tmp`, next)
-  renameSync(`${file}.tmp`, file)
+  // keep the file's perms (it may hold API keys) and edit a symlinked config at its target
+  const target = exists ? realpathSync(file) : file
+  const mode = exists ? statSync(target).mode & 0o777 : 0o600
+  const write = (f: string, data: string) => (writeFileSync(f, data, { mode }), chmodSync(f, mode))
+  if (exists) write(`${file}.bak-cursor-auth`, original)
+  write(`${target}.tmp`, next)
+  renameSync(`${target}.tmp`, target)
   console.log(`Added "${ENTRY}" to "plugin"${exists ? ` (backup: ${file}.bak-cursor-auth)` : ""}.\n\n${NEXT}`)
   return 0
 }
