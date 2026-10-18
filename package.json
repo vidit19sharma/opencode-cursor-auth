@@ -1,6 +1,6 @@
 {
   "name": "@vidit19sharma/opencode-cursor-auth",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "OpenCode plugin that uses your Cursor subscription via the official @cursor/sdk — no proxy server, one-time browser login, in-process bridge.",
   "type": "module",
   "main": "dist/index.js",
