@@ -2,7 +2,34 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.1 — 2026-10-16
+
+### Changed
+
+- `@cursor/sdk` is pinned to an exact version.
+- `npm test` / `bun run test` runs the offline suites (plugin, bridge and CLI unit tests); the real-account e2e suite moved to `bun run test:e2e`.
+
+### Fixed
+
+- The startup sweep of `~/.cursor/projects` matched any directory ending in `-opencode-cursor-<6 chars>`, so it could delete Cursor's data for an unrelated real project with such a path. It now matches only the exact slug of the bridge's own temp workspaces.
+- One malformed entry in `sessions.json` made every request fail until opencode was restarted. Entries are validated on load, and a load error no longer sticks.
+- The model catalog was fetched with the browser-login key only, so users who pasted an API key saw only `cursor/auto`. The catalog now uses the same key as requests.
+- The 2-hour cap on a parked run could overrun by up to 10 minutes and left the session flagged busy. The cap is now exact and clears the flag.
+- A parked tool call's promise was never rejected when its run was released.
+- Session resume never worked on Windows (the workspace permission check failed there); the mode check is skipped on Windows.
+- The plugin's cache (`models.json`, `sessions.json`) now honours `XDG_CACHE_HOME`, as the CLI already did.
+- `setup` printed the next steps in the wrong order; it now says log in, restart opencode, then list models.
+
+### Security
+
+- Releasing a workspace now requires it to be a real, private directory owned by the current user before removing it (a shared `/tmp` on Linux could otherwise be abused).
+- `setup` keeps the config file's permission mode and edits a symlinked config in place instead of replacing the link with a regular file.
+
 ## 0.4.0 — 2026-10-16
+
+### Added
+
+- GitHub Actions CI (build, unit and CLI tests, single-export check) and an in-repo `RELEASE.md`.
 
 ### Changed
 
@@ -13,11 +40,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - A failed browser login printed nothing; the reason now goes to stderr. A successful login resets the key-status cache, so the first request works without waiting out the 60-second cache.
 - `Agent.create` and `send` carry an idempotency key across retry attempts.
 
-### Added
-
-- GitHub Actions CI (build, unit and CLI tests, single-export check) and an in-repo `RELEASE.md`.
-
-## 0.3.6 — 2026-10-16
+## 0.3.6 — 2026-10-16 (tagged, not published to npm; shipped in 0.4.0)
 
 ### Added
 
@@ -25,12 +48,15 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 
+- When a conversation is replayed into a fresh agent, each turn is wrapped in nonce delimiters so text inside a tool result cannot pose as a user turn.
+
+### Security
+
 - Cursor's built-in tools (shell, read, edit, …) are now explicitly disabled on every agent, not only via the `tools: ["mcp"]` header. The model can only act through opencode's tools.
 - A stored workspace is resumed only if it is still a real, private directory owned by the current user. A path swapped for a symlink or opened up to other users drops the session entry instead of being reused.
 - `sessions.json` and `models.json` are written `0600` (cache directory `0700`). Existing files are fixed on the next save.
-- When a conversation is replayed into a fresh agent, each turn is wrapped in nonce delimiters so text inside a tool result cannot pose as a user turn.
 
-## 0.3.5 — 2026-10-16 (not published to npm; included in 0.3.6)
+## 0.3.5 — 2026-10-16 (tagged, not published to npm; shipped in 0.4.0)
 
 ### Fixed
 
@@ -90,11 +116,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - opencode crashed at startup on a fresh machine (`undefined is not an object (evaluating 'C.provider')`, and `C.auth` on `opencode auth login`) as soon as the plugin was enabled. opencode invokes **every named export** of a plugin module as a plugin; the entry module also exported `CursorAuthPlugin`, `keyProblem` and `parseContext`, so opencode called the helpers as plugins and tried to read hooks off their return values. The entry now exposes only `default`; helpers moved to `src/plugin.ts`. Affects 0.1.0–0.3.0. A test guards the export shape.
 
-## 0.3.0 — 2026-10-16
-
-### Breaking
-
-- The suffixed variant ids from 0.2.0 (`cursor/gpt-5.5-low`, `cursor/claude-opus-5-5-1m-max`, …) no longer exist; Cursor rejects them with 400 "Cannot use this model". Migrate `cursor/gpt-5.5-low` to model `cursor/gpt-5.5` + variant `low` (Ctrl+T in the TUI, or `variant:` in config).
+## 0.3.0 — 2026-10-16 (tagged, not published to npm; shipped in 0.3.1)
 
 ### Added
 
@@ -105,6 +127,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- **Breaking:** the suffixed variant ids from 0.2.0 (`cursor/gpt-5.5-low`, `cursor/claude-opus-5-5-1m-max`, …) no longer exist; Cursor rejects them with 400 "Cannot use this model". Migrate `cursor/gpt-5.5-low` to model `cursor/gpt-5.5` + variant `low` (Ctrl+T in the TUI, or `variant:` in config).
 - A base id now means Cursor's own default variant (`isDefault`), sends its params explicitly, and gets that variant's context limit; previously it implied the first-listed param values and under-reported context (`gpt-5.5`: 272k → 1M).
 - Models cache bumped to v4 `{name, context, params, variants, allowed}`; older cache files are refetched once.
 
